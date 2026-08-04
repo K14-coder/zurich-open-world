@@ -43,7 +43,7 @@ MLY_CACHE = HERE / "cache" / "mapillary"
 IMG_CACHE = HERE / "cache" / "mly_images"
 IMG_CACHE.mkdir(parents=True, exist_ok=True)
 
-PIXELS_PER_METRE = 20          # 5 cm/px
+PIXELS_PER_METRE = 40          # 2.5 cm/px — enough to read signage
 MAX_RANGE = 30.0
 MAX_OFF_AXIS = math.radians(65)
 # Stricter gates for *texturing* than for counting coverage. A wall seen from
@@ -69,8 +69,9 @@ def view_weight(distance: float, incidence_cos: float) -> float:
 # terrain is both simpler and far more robust.
 CAMERA_HEIGHT = 2.2
 
-FIELDS = ("id,thumb_2048_url,computed_geometry,computed_rotation,camera_type,"
-          "camera_parameters,is_pano,captured_at,sequence,width,height")
+FIELDS = ("id,thumb_original_url,thumb_2048_url,computed_geometry,"
+          "computed_rotation,camera_type,camera_parameters,is_pano,captured_at,"
+          "sequence,width,height")
 
 
 def token() -> str:
@@ -147,10 +148,10 @@ def sample_bilinear(img: np.ndarray, px: np.ndarray, py: np.ndarray) -> np.ndarr
     y0 = np.clip(np.floor(py).astype(np.int32), 0, h - 2)
     fx = np.clip(px - x0, 0, 1)[..., None]
     fy = np.clip(py - y0, 0, 1)[..., None]
-    a = img[y0, x0] * (1 - fx) * (1 - fy)
-    b = img[y0, x0 + 1] * fx * (1 - fy)
-    c = img[y0 + 1, x0] * (1 - fx) * fy
-    d = img[y0 + 1, x0 + 1] * fx * fy
+    a = img[y0, x0].astype(np.float32) * (1 - fx) * (1 - fy)
+    b = img[y0, x0 + 1].astype(np.float32) * fx * (1 - fy)
+    c = img[y0 + 1, x0].astype(np.float32) * (1 - fx) * fy
+    d = img[y0 + 1, x0 + 1].astype(np.float32) * fx * fy
     return a + b + c + d
 
 
@@ -192,7 +193,12 @@ def fetch_details(ids: list[str], tok: str) -> dict:
 def fetch_pixels(meta: dict) -> np.ndarray | None:
     path = IMG_CACHE / f"{meta['id']}.jpg"
     if not path.exists():
-        url = meta.get("thumb_2048_url")
+        # Originals, not the 2048 thumbnail. On a 5660x2830 panorama the
+        # thumbnail throws away 2.8x of linear resolution: 4.6 cm/px on a wall
+        # at 15 m versus 1.7 cm/px. That single choice is why every plate so far
+        # has been soft, and 1.7 cm/px is the difference between a smudge and a
+        # legible shop sign.
+        url = meta.get("thumb_original_url") or meta.get("thumb_2048_url")
         if not url:
             return None
         try:
@@ -205,10 +211,11 @@ def fetch_pixels(meta: dict) -> np.ndarray | None:
         img = Image.open(path).convert("RGB")
     except Exception:  # noqa: BLE001
         return None
-    # The thumbnail is not the full-resolution frame the intrinsics describe, so
-    # rescale the stored dimensions to match what we actually sampled.
+    # Whatever size actually arrived is what the intrinsics must be scaled to.
     meta["width"], meta["height"] = img.size
-    return np.asarray(img).astype(np.float32)
+    # Keep as uint8: seven 5660x2830 views as float32 would be 1.3 GB, and the
+    # bilinear sampler promotes only the four neighbours it gathers.
+    return np.asarray(img)
 
 
 
@@ -343,7 +350,7 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
         # Segment once per photograph, not once per candidate plane: the plane
         # search evaluates hundreds of poses against these same frames.
         try:
-            facade = segment.facade_mask(pixels.astype(np.uint8), cache_key=meta["id"])
+            facade = segment.facade_mask(pixels, cache_key=meta["id"])
         except Exception as exc:  # noqa: BLE001
             print(f"    ! segmentation failed for {meta['id']}: {exc}", file=sys.stderr)
             facade = np.ones(pixels.shape[:2], dtype=bool)
