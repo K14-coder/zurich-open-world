@@ -511,9 +511,11 @@ final class Renderer {
         float photographic = 0.0;
         float gloss = 0.0;
 
-        // Terrain and roofs are the aerial photograph itself. The ortho is
-        // top-down, so every building's real roof already sits in it at that XZ.
-        bool photoSurface = (in.material > 2.5)
+        // Terrain, pavement and roofs are the aerial photograph itself. The
+        // ortho is top-down, so every building's real roof already sits in it at
+        // that XZ. Note the upper bound: foliage (4) and road (5) live above
+        // this range and must not be caught by it.
+        bool photoSurface = (in.material > 2.5 && in.material < 3.5)
                          || (in.material > 1.5 && in.material < 2.5);
         if (photoSurface && u.flags.x > 0.5) {
             float2 uv = float2((in.world.x - u.orthoExtent.x)
@@ -524,12 +526,33 @@ final class Renderer {
             photographic = 1.0;
         } else if (in.material > 0.5 && in.material < 1.5) {
             albedo = facade(albedo, in.world, n, in.params, viewDir, u, gloss);
-        } else {
-            // Carriageway. A single flat grey reads as poured concrete, so break
-            // it up: coarse patch variation for resurfacing, fine speckle for
-            // aggregate, and a damp sheen that catches the sun at low angles.
-            // Fine aggregate only. Coarse patch variation on an axis-aligned
-            // grid reads as a checkerboard, which is worse than flat grey.
+        } else if (in.material > 3.5 && in.material < 4.5) {
+            // Foliage.
+            //
+            // A crown is a 32-triangle blob, and at close range its polygonal
+            // outline is unmistakable — worse than no tree at all. Subdividing
+            // it into a smooth ball would cost a million triangles across 7,822
+            // trees and still read as a green boulder, because the problem is
+            // the *silhouette*, not the facets.
+            //
+            // So punch holes in it instead. Discarding on a leaf-scale noise
+            // field makes the outline ragged and lets you see through the crown,
+            // which is what a real canopy does. Holes are biased towards the
+            // silhouette, where the outline actually shows, leaving the middle
+            // of the crown dense.
+            float3 cell = floor(in.world * 7.0);
+            float leaf = hash11(cell.x * 3.0 + cell.y * 17.0 + cell.z * 29.0);
+            float rim = 1.0 - abs(dot(n, viewDir));
+            if (leaf < 0.10 + rim * 0.34) discard_fragment();
+
+            albedo *= 0.78 + leaf * 0.44;
+            // Light coming through from behind is what makes a canopy glow
+            // rather than sit there as a solid object.
+            float back = max(0.0, dot(-n, sun));
+            albedo += albedo * pow(back, 2.0) * 0.45;
+        } else if (in.material > 4.5) {
+            // Carriageway. Fine aggregate only — coarse patch variation on an
+            // axis-aligned grid reads as a checkerboard, worse than flat grey.
             float grain = hash11(floor(in.world.x * 4.7) * 7.0
                                + floor(in.world.z * 4.7) * 13.0);
             albedo *= 0.975 + grain * 0.05;

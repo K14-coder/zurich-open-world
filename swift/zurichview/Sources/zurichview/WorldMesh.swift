@@ -23,7 +23,9 @@ struct Vertex {
         case plain = 0      // terrain, roads
         case wall = 1       // building façades — gets procedural windows
         case roof = 2
-        case ortho = 3      // terrain — sampled from the aerial photograph
+        case ortho = 3      // terrain and pavement — from the aerial photograph
+        case foliage = 4    // tree canopy
+        case road = 5       // carriageway — gets asphalt treatment
     }
 
     init(position: SIMD3<Float>, normal: SIMD3<Float>,
@@ -37,16 +39,18 @@ struct Vertex {
 }
 
 final class WorldMesh {
-    private(set) var vertices: [Vertex] = []
-    private(set) var indices: [UInt32] = []
+    var vertices: [Vertex] = []
+    var indices: [UInt32] = []
 
     /// Where each part of the world starts in the index buffer, so the renderer
     /// can draw them with different pipeline state later if it needs to.
     private(set) var terrainRange: Range<Int> = 0..<0
     private(set) var roadRange: Range<Int> = 0..<0
     private(set) var buildingRange: Range<Int> = 0..<0
+    private(set) var streetscapeRange: Range<Int> = 0..<0
 
     private let terrain: TerrainGrid
+    private var storedEdges: [WorldJSON.Edge] = []
 
     struct TerrainGrid {
         let x0: Double, z0: Double, cell: Double
@@ -82,6 +86,7 @@ final class WorldMesh {
             buildings = try JSONDecoder().decode(BuildingsJSON.self, from: data).buildings
         }
 
+        storedEdges = world.edges
         let urban = UrbanMask(edges: world.edges, buildings: buildings, terrain: terrain)
         buildTerrain(urban: urban)
         buildRoads(world.edges)
@@ -247,7 +252,7 @@ final class WorldMesh {
                     vertices.append(Vertex(
                         position: SIMD3(Float(corner.x), Float(corner.y), Float(corner.z)),
                         normal: SIMD3(0, 1, 0),
-                        colour: colour))
+                        colour: colour, material: .road))
                 }
                 indices += [base, base + 2, base + 1, base + 1, base + 2, base + 3]
             }
@@ -338,6 +343,9 @@ final class WorldMesh {
     }
 
     func terrainHeight(x: Double, z: Double) -> Double { terrain.height(x: x, z: z) }
+
+    func setStreetscapeRange(_ r: Range<Int>) { streetscapeRange = r }
+    var roadEdgesForPavement: [WorldJSON.Edge] { storedEdges }
 }
 
 private func mix(_ a: SIMD3<Float>, _ b: SIMD3<Float>, t: Float) -> SIMD3<Float> {

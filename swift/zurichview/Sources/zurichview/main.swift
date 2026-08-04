@@ -32,6 +32,12 @@ print("  \(mesh.vertices.count) vertices, \(mesh.indices.count / 3) triangles")
 print("  terrain \(mesh.terrainRange.count / 3), roads \(mesh.roadRange.count / 3), "
     + "buildings \(mesh.buildingRange.count / 3) triangles")
 
+clock = Date()
+mesh.buildStreetscape(url: locate("zurich_streetscape.json"))
+print(String(format: "Streetscape built in %.2f s — %d triangles",
+             -clock.timeIntervalSinceNow, mesh.streetscapeRange.count / 3))
+print("  total \(mesh.indices.count / 3) triangles")
+
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
 clock = Date()
