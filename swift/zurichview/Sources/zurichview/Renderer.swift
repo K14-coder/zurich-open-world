@@ -41,6 +41,7 @@ final class Renderer {
     private let indexCount: Int
     private let shadowCasterRange: Range<Int>
     private var ortho: Ortho?
+    private var materials: Materials?
     private var sampler: MTLSamplerState!
     private var shadowSampler: MTLSamplerState!
     private let shadowMap: MTLTexture
@@ -156,6 +157,12 @@ final class Renderer {
         ortho = Ortho(imageURL: imageURL, metaURL: metaURL, device: device, queue: queue)
     }
 
+    @discardableResult
+    func loadMaterials(directory: URL) -> Bool {
+        materials = Materials(directory: directory, device: device, queue: queue)
+        return materials != nil
+    }
+
     // MARK: - Encoding
 
     private func lightMatrix(camera: Camera) -> simd_float4x4 {
@@ -186,7 +193,9 @@ final class Renderer {
             skyTop: SIMD4(skyTop, 0),
             skyHorizon: SIMD4(skyHorizon, 0),
             orthoExtent: ortho?.extent ?? .zero,
-            flags: SIMD4(ortho == nil ? 0 : 1, Float(height), 0, 0))
+            flags: SIMD4(ortho == nil ? 0 : 1, Float(height),
+                         materials == nil ? 0 : 1,
+                         Float(materials?.wallLayers ?? 1)))
 
         // --- Shadow pass ---
         let shadowPass = MTLRenderPassDescriptor()
@@ -226,6 +235,9 @@ final class Renderer {
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentTexture(ortho?.texture, index: 0)
         enc.setFragmentTexture(shadowMap, index: 1)
+        enc.setFragmentTexture(materials?.albedo, index: 2)
+        enc.setFragmentTexture(materials?.normal, index: 3)
+        enc.setFragmentTexture(materials?.roughness, index: 4)
         enc.setFragmentSamplerState(sampler, index: 0)
         enc.setFragmentSamplerState(shadowSampler, index: 1)
         enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
@@ -330,7 +342,8 @@ final class Renderer {
         float4 skyTop;
         float4 skyHorizon;
         float4 orthoExtent;
-        float4 flags;       // x = ortho bound, y = viewport height
+        float4 flags;       // x = ortho bound, y = viewport height,
+                            // z = materials bound, w = wall layer count
     };
 
     // float3, NOT packed_float3: SIMD3<Float> is 16-byte aligned in Swift, so
@@ -502,6 +515,9 @@ final class Renderer {
                                    constant Uniforms& u [[buffer(1)]],
                                    texture2d<float> ortho [[texture(0)]],
                                    depth2d<float> shadowMap [[texture(1)]],
+                                   texture2d_array<float> matAlbedo [[texture(2)]],
+                                   texture2d_array<float> matNormal [[texture(3)]],
+                                   texture2d_array<float> matRough [[texture(4)]],
                                    sampler orthoSampler [[sampler(0)]],
                                    sampler shadowSampler [[sampler(1)]]) {
         float3 n = normalize(in.normal);
@@ -510,6 +526,8 @@ final class Renderer {
         float3 albedo = in.colour;
         float photographic = 0.0;
         float gloss = 0.0;
+        float roughness = 0.8;
+        bool haveMaterials = u.flags.z > 0.5;
 
         // Terrain, pavement and roofs are the aerial photograph itself. The
         // ortho is top-down, so every building's real roof already sits in it at
@@ -525,6 +543,31 @@ final class Renderer {
             albedo = ortho.sample(orthoSampler, uv).rgb;
             photographic = 1.0;
         } else if (in.material > 0.5 && in.material < 1.5) {
+            // Scanned plaster or concrete under the procedural architecture: the
+            // material supplies grain and relief, the façade function supplies
+            // the windows, sills and cornices. Neither alone is convincing.
+            if (haveMaterials) {
+                float along = (abs(n.x) > abs(n.z)) ? in.world.z : in.world.x;
+                float2 uv = float2(along, -in.world.y) / 2.4;
+                float layer = floor(in.params.z * u.flags.w);
+                layer = clamp(layer, 0.0, u.flags.w - 1.0);
+
+                float3 tex = matAlbedo.sample(orthoSampler, uv, uint(layer)).rgb;
+                roughness = matRough.sample(orthoSampler, uv, uint(layer)).r;
+
+                // Tangent frame straight from the wall: these are vertical
+                // surfaces, so world up crossed with the normal is the tangent.
+                float3 T = normalize(cross(float3(0, 1, 0), n));
+                float3 B = cross(n, T);
+                float3 tn = matNormal.sample(orthoSampler, uv, uint(layer)).rgb * 2.0 - 1.0;
+                n = normalize(T * tn.x + B * tn.y + n * max(tn.z, 0.15));
+
+                // Keep the per-building palette tint, but let the photograph
+                // carry the detail. Normalised about mid-grey so a dark material
+                // does not simply darken the building.
+                float lum = max(0.03, dot(tex, float3(0.3333)));
+                albedo = albedo * (tex / lum);
+            }
             albedo = facade(albedo, in.world, n, in.params, viewDir, u, gloss);
         } else if (in.material > 3.5 && in.material < 4.5) {
             // Foliage.
@@ -551,11 +594,23 @@ final class Renderer {
             float back = max(0.0, dot(-n, sun));
             albedo += albedo * pow(back, 2.0) * 0.45;
         } else if (in.material > 4.5) {
-            // Carriageway. Fine aggregate only — coarse patch variation on an
-            // axis-aligned grid reads as a checkerboard, worse than flat grey.
-            float grain = hash11(floor(in.world.x * 4.7) * 7.0
-                               + floor(in.world.z * 4.7) * 13.0);
-            albedo *= 0.975 + grain * 0.05;
+            // Carriageway: scanned asphalt, which has the aggregate and the
+            // subtle relief that no amount of hashing produced.
+            if (haveMaterials) {
+                uint layer = uint(u.flags.w);      // road sits after the walls
+                float2 uv = in.world.xz / 6.0;
+                float3 tex = matAlbedo.sample(orthoSampler, uv, layer).rgb;
+                roughness = matRough.sample(orthoSampler, uv, layer).r;
+                float3 tn = matNormal.sample(orthoSampler, uv, layer).rgb * 2.0 - 1.0;
+                // Ground plane: tangent frame is world X and Z.
+                n = normalize(float3(tn.x, max(tn.z, 0.30), tn.y));
+                float lum = max(0.03, dot(tex, float3(0.3333)));
+                albedo = albedo * (tex / lum);
+            } else {
+                float grain = hash11(floor(in.world.x * 4.7) * 7.0
+                                   + floor(in.world.z * 4.7) * 13.0);
+                albedo *= 0.975 + grain * 0.05;
+            }
             gloss = 0.16;
         }
 
@@ -564,16 +619,18 @@ final class Renderer {
 
         float3 direct = float3(1.18, 1.09, 0.94) * ndl * visibility;
         float hemi = 0.5 + 0.5 * n.y;
-        float3 ambient = mix(float3(0.26, 0.27, 0.28), float3(0.40, 0.45, 0.53), hemi);
+        float3 ambient = mix(float3(0.31, 0.32, 0.34), float3(0.47, 0.52, 0.60), hemi);
         // Shadowed surfaces still see sky, just not sun.
-        ambient *= mix(0.82, 1.0, visibility);
+        // Dark materials in canyon shade crush to black otherwise: a shaded
+        // street is darker than a sunlit one, not absent.
+        ambient *= mix(0.90, 1.0, visibility);
 
         float3 lit = albedo * (direct + ambient);
 
         float3 halfway = normalize(-viewDir + sun);
-        float specPower = mix(52.0, 180.0, gloss);
+        float specPower = mix(mix(96.0, 12.0, roughness), 180.0, gloss);
         float spec = pow(max(dot(n, halfway), 0.0), specPower)
-                   * mix(0.05 * step(0.9, n.y), 0.55, gloss) * visibility;
+                   * mix(0.05 + 0.18 * (1.0 - roughness), 0.55, gloss) * visibility;
         lit += spec;
 
         // An aerial photograph already carries the sun that took it. Relighting

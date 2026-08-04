@@ -8,3 +8,4 @@ tools/*_raw.json
 *_raw.json
 
 .DS_Store
+tools/cache/

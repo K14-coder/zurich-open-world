@@ -1,0 +1,15 @@
+{
+  "size": 1024,
+  "layers": 8,
+  "assets": [
+    "Plaster001",
+    "Plaster002",
+    "Plaster003",
+    "Plaster004",
+    "PaintedPlaster017",
+    "Concrete034",
+    "Concrete036",
+    "Concrete030"
+  ],
+  "licence": "CC0 via ambientCG"
+}

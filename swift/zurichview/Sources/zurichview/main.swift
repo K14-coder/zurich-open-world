@@ -43,6 +43,13 @@ let renderer = try Renderer(mesh: mesh)
 clock = Date()
 renderer.loadOrtho(imageURL: orthoImageURL, metaURL: orthoMetaURL)
 print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
+clock = Date()
+let materialsDir = worldURL.deletingLastPathComponent().appendingPathComponent("materials")
+if renderer.loadMaterials(directory: materialsDir) {
+    print(String(format: "PBR materials loaded in %.2f s", -clock.timeIntervalSinceNow))
+} else {
+    print("PBR materials NOT loaded — falling back to procedural surfaces")
+}
 
 /// Eye point for a driver: on the road, at seat height, looking down the street.
 func driverCamera(street: String, back: Float = 0, lift: Float = 1.35) -> Camera? {

@@ -264,10 +264,10 @@ final class WorldMesh {
         switch cls.replacingOccurrences(of: "_link", with: "") {
         // Real asphalt is dark, but a dark albedo under canyon shade crushes to
         // black once tone mapping is applied. These are lifted deliberately.
-        case "motorway", "trunk":       return SIMD3(0.170, 0.170, 0.184)
-        case "primary", "secondary":    return SIMD3(0.162, 0.162, 0.176)
-        case "service":                 return SIMD3(0.185, 0.181, 0.176)
-        default:                        return SIMD3(0.155, 0.155, 0.168)
+        case "motorway", "trunk":       return SIMD3(0.215, 0.215, 0.230)
+        case "primary", "secondary":    return SIMD3(0.205, 0.205, 0.222)
+        case "service":                 return SIMD3(0.230, 0.226, 0.220)
+        default:                        return SIMD3(0.198, 0.198, 0.213)
         }
     }
 
