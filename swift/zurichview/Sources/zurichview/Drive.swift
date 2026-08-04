@@ -95,7 +95,7 @@ final class DriveView: MTKView, MTKViewDelegate {
         var steerInput = 0.0
         if held.contains(Key.a.rawValue) || held.contains(Key.left.rawValue) { steerInput -= 1 }
         if held.contains(Key.d.rawValue) || held.contains(Key.right.rawValue) { steerInput += 1 }
-        if held.contains(Key.r.rawValue) { respawn(on: "Bahnhofstrasse") }
+        if held.contains(Key.r.rawValue) { respawn(on: "Freiestrasse") }
         if held.contains(Key.escape.rawValue) { NSApp.terminate(nil) }
 
         let sample = network.sampleGround(x: position.x, z: position.z)
@@ -137,7 +137,7 @@ func runInteractive(mesh: WorldMesh, network: RoadNetwork, renderer: Renderer) {
     window.center()
 
     let view = DriveView(frame: frame, renderer: renderer, network: network,
-                         start: "Bahnhofstrasse")
+                         start: "Freiestrasse")
     window.contentView = view
     window.makeFirstResponder(view)
     window.makeKeyAndOrderFront(nil)

@@ -75,7 +75,7 @@ struct Shot {
 
 var shots: [Shot] = []
 
-for street in ["Bahnhofstrasse", "Limmatquai", "Rämistrasse"] {
+for street in ["Freiestrasse", "Hottingerstrasse", "Zeltweg"] {
     if let cam = driverCamera(street: street) {
         shots.append(Shot(name: "street-\(street.lowercased())", camera: cam,
                           note: "driver's eye on \(street)"))
@@ -85,14 +85,14 @@ for street in ["Bahnhofstrasse", "Limmatquai", "Rämistrasse"] {
 // An oblique over the middle of the city, high enough to read the street plan.
 shots.append(Shot(
     name: "aerial",
-    camera: Camera(eye: SIMD3(-900, 620, 1150), target: SIMD3(120, 20, -150), fovDegrees: 48),
-    note: "oblique over the centre"))
+    camera: Camera(eye: SIMD3(900, 430, 1150), target: SIMD3(1500, 40, 500), fovDegrees: 48),
+    note: "oblique over Hottingen"))
 
 // Low over the Limmat, where the bridges and the old town are.
 shots.append(Shot(
-    name: "limmat",
-    camera: Camera(eye: SIMD3(300, 70, 420), target: SIMD3(120, 8, -260), fovDegrees: 55),
-    note: "low over the Limmat"))
+    name: "hottingen-low",
+    camera: Camera(eye: SIMD3(1280, 55, 820), target: SIMD3(1560, 25, 430), fovDegrees: 55),
+    note: "low over Freiestrasse"))
 
 let width = 1400, height = 850
 for shot in shots {
