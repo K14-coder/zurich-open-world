@@ -50,8 +50,19 @@ MAX_OFF_AXIS = math.radians(65)
 # 28 m at 60° incidence is foreshortened into a few dozen pixels of mush; it
 # counts as a pass but it can never agree with a head-on view, and including it
 # is what keeps the composite blurred.
-TEX_MAX_RANGE = 20.0
-TEX_MAX_INCIDENCE = math.radians(45)
+TEX_MAX_RANGE = 30.0
+TEX_MAX_INCIDENCE = math.radians(62)
+
+
+def view_weight(distance: float, incidence_cos: float) -> float:
+    """How much a view's opinion is worth.
+
+    Resolution on the wall falls off with distance and with the cosine of
+    incidence, so weight by both. Squaring the cosine reflects that an oblique
+    view loses detail along one axis *and* smears it along the other.
+    """
+    near = max(0.0, min(1.0, (TEX_MAX_RANGE - distance) / (TEX_MAX_RANGE - 6.0)))
+    return max(1e-3, (incidence_cos ** 2) * (0.25 + 0.75 * near))
 # Camera height above the road. Mapillary's computed_altitude is WGS84
 # ellipsoidal, which sits ~50 m off orthometric height in Switzerland; getting
 # that wrong shears the whole façade vertically, so a fixed height above our own
@@ -295,10 +306,12 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
             continue
         # Incidence: how square-on the camera sits to the wall, which decides
         # how much real resolution this view can contribute.
-        if ((x - mx) * nx + (z - mz) * nz) / dist < math.cos(TEX_MAX_INCIDENCE):
+        incidence = ((x - mx) * nx + (z - mz) * nz) / dist
+        if incidence < math.cos(TEX_MAX_INCIDENCE):
             continue
         if occluders is not None and blocked(x, z, mx, mz, f["b"], occluders):
             continue
+        img["_w"] = view_weight(dist, incidence)
         cands.append((dist, img))
     if not cands:
         return None, 0
@@ -342,12 +355,13 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
             "R": rodrigues(meta["computed_rotation"]),
             "cx": cx, "cz": cz,
             "cy": terrain_at(grid, cx, cz) + CAMERA_HEIGHT,
+            "w": img.get("_w", 1.0),
         })
     if len(prepared) < 3:
         return None, len(prepared)
 
     def sample(Px, Py, Pz):
-        views, masks = [], []
+        views, masks, weights = [], [], []
         for p in prepared:
             enu = np.stack([Px - p["cx"], -(Pz - p["cz"]), Py - p["cy"]], axis=-1)
             cam = enu @ p["R"].T
@@ -366,7 +380,8 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
             keep = sample_nearest(p["facade_eroded"], pxpy[..., 0], pxpy[..., 1])
             views.append(shot)
             masks.append(valid & keep)
-        return views, masks
+            weights.append(p["w"])
+        return views, masks, weights
 
     params, score = plane_fit.fit(f, sample, verbose=True)
     if params is None:
@@ -376,14 +391,14 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
     height = min(f["h"], plane_fit.FIT_HEIGHT)
     Px, Py, Pz = plane_fit.plane_grid(f, offset, yaw, base_dy,
                                       PIXELS_PER_METRE, height)
-    views, masks = sample(Px, Py, Pz)
+    views, masks, weights = sample(Px, Py, Pz)
     if len(views) < 2:
         return None, len(views)
 
     raw_first = views[0]
     views, masks, aligned = align_views(views, masks)
     views = match_exposure(views, masks)
-    plate, covered = median_composite(views, masks, return_coverage=True)
+    plate, covered = median_composite(views, masks, weights, return_coverage=True)
 
     # Anything permanently occluded in every pass -- a car that never moved --
     # was never photographed, so it has to be reconstructed rather than

@@ -32,22 +32,31 @@ HERE = pathlib.Path(__file__).parent
 
 def median_composite(images: list[np.ndarray],
                      masks: list[np.ndarray] | None = None,
+                     weights: list[float] | None = None,
                      return_coverage: bool = False):
     """Per-pixel median across aligned views.
 
-    `masks` optionally marks known-bad pixels (segmented vehicles, or areas the
+    `masks` marks known-bad pixels (segmented vehicles, or areas the
     rectification could not fill). Masked pixels are excluded from the vote
-    instead of being counted as evidence.
+    rather than counted as evidence.
+
+    `weights` lets a view count for less without being thrown away. Hard-
+    rejecting every oblique or distant view left only three or four per façade,
+    which is too little evidence; a weighted median keeps them contributing in
+    proportion to how much resolution they actually carry.
     """
     if not images:
         raise ValueError("no images")
     stack = np.stack(images).astype(np.float32)
 
-    if masks is None:
+    if masks is None and weights is None:
         out = np.median(stack, axis=0).astype(np.uint8)
         if return_coverage:
             return out, np.ones(out.shape[:2], dtype=bool)
         return out
+
+    if weights is not None:
+        return _weighted_median(stack, masks, weights, return_coverage)
 
     valid = np.stack(masks).astype(bool)
     out = np.zeros(stack.shape[1:], dtype=np.float32)
@@ -69,6 +78,40 @@ def median_composite(images: list[np.ndarray],
     # reappeared in the finished plate. Report it as a hole for inpainting.
     if return_coverage:
         return out, any_valid
+    return out
+
+
+def _weighted_median(stack: np.ndarray, masks, weights, return_coverage):
+    """Weighted per-pixel median.
+
+    Weights are per-view scalars, which makes this tractable: sort the values
+    along the view axis, carry each value's weight with it, and take the value
+    where the cumulative weight first crosses half the total. Masked pixels get
+    zero weight and so can never be selected.
+    """
+    n = stack.shape[0]
+    w = np.asarray(weights, dtype=np.float32).reshape(n, 1, 1, 1)
+    w = np.broadcast_to(w, stack.shape).copy()
+    if masks is not None:
+        valid = np.stack(masks).astype(bool)
+        w *= valid[..., None].astype(np.float32)
+
+    order = np.argsort(stack, axis=0)
+    vals = np.take_along_axis(stack, order, axis=0)
+    ws = np.take_along_axis(w, order, axis=0)
+
+    cum = np.cumsum(ws, axis=0)
+    total = cum[-1]
+    # Where nothing is valid the total is zero; those are holes, reported through
+    # the coverage mask rather than filled with an arbitrary value.
+    target = total * 0.5
+    pick = np.argmax(cum >= target[None], axis=0)
+    out = np.take_along_axis(vals, pick[None], axis=0)[0]
+    out = np.clip(np.nan_to_num(out), 0, 255).astype(np.uint8)
+
+    if return_coverage:
+        covered = total[..., 0] > 1e-6
+        return out, covered
     return out
 
 

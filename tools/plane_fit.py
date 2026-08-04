@@ -66,7 +66,21 @@ def plane_grid(f: dict, offset: float, yaw: float, base_dy: float,
     return Px, Py, Pz
 
 
-def agreement(views: list, masks: list, plate: np.ndarray) -> float:
+def highpass(g: np.ndarray) -> np.ndarray:
+    """Strip the low frequencies before correlating.
+
+    Plain NCC has its own degeneracy, just as sharpness did. Sliding the plane
+    towards the camera magnifies the sampling, which smooths every view, and
+    smooth images correlate better — so the fit pinned at the near edge of its
+    search on every façade. Correlating only the detail removes that reward: a
+    magnified blur has no high frequencies to agree about.
+    """
+    import cv2
+    return g - cv2.GaussianBlur(g, (0, 0), 2.0)
+
+
+def agreement(views: list, masks: list, plate: np.ndarray,
+              weights: list | None = None) -> float:
     """Mean normalised cross-correlation of each view against the composite.
 
     NOT gradient energy. Sharpness looks like the obvious objective — blur is
@@ -79,13 +93,16 @@ def agreement(views: list, masks: list, plate: np.ndarray) -> float:
     scaling, so it measures only whether the views actually depict the same
     thing in the same place.
     """
-    ref = plate.astype(np.float32).mean(axis=2)
-    total, n = 0.0, 0
-    for v, m in zip(views, masks):
+    ref = highpass(plate.astype(np.float32).mean(axis=2))
+    if weights is None:
+        weights = [1.0] * len(views)
+    total, n = 0.0, 0.0
+    for v, m, wt in zip(views, masks, weights):
         if m.sum() < 64:
             continue
+        vh = highpass(v.astype(np.float32).mean(axis=2))
         a = ref[m]
-        b = v.astype(np.float32).mean(axis=2)[m]
+        b = vh[m]
         a = a - a.mean()
         b = b - b.mean()
         # A featureless patch correlates with anything; it is not evidence.
@@ -94,30 +111,59 @@ def agreement(views: list, masks: list, plate: np.ndarray) -> float:
         denom = math.sqrt(float((a * a).sum()) * float((b * b).sum()))
         if denom < 1e-6:
             continue
-        total += float((a * b).sum()) / denom
-        n += 1
-    if n < 3:
+        # Weight the fit exactly as the composite is weighted. Leaving the
+        # objective unweighted while weighting the median let re-admitted
+        # oblique views drag the plane around with full authority, which made
+        # the fits noticeably worse than when those views were simply rejected.
+        total += wt * float((a * b).sum()) / denom
+        n += wt
+    if n < 1.5:
         return -1.0
     return total / n
+
+
+def sweep(f: dict, sample_fn, axis: str = "offset", n: int = 11):
+    """Objective value along one axis, for diagnosing whether the fit has any
+    signal to work with at all.
+
+    Worth running before trusting any result from `fit`. On Freiestrasse the
+    offset sweep came back flat — 0.271 to 0.300 across the full ±2.5 m range,
+    with no peak — which is why the search pinned at its bounds on every façade.
+    It was not choosing badly; there was nothing to choose.
+    """
+    from clean_plate import median_composite
+    rows = []
+    for value in np.linspace(-OFFSET_RANGE, OFFSET_RANGE, n):
+        args = {"offset": 0.0, "yaw": 0.0, "base_dy": 0.0}
+        args[axis if axis != "yaw" else "yaw"] = value if axis != "yaw" else math.radians(value)
+        Px, Py, Pz = plane_grid(f, args["offset"], args["yaw"], args["base_dy"],
+                                FIT_PPM, FIT_HEIGHT)
+        views, masks, weights = sample_fn(Px, Py, Pz)
+        if len(views) < 3:
+            rows.append((value, None, len(views)))
+            continue
+        plate = median_composite(views, masks, weights)
+        rows.append((value, agreement(views, masks, plate, weights), len(views)))
+    return rows
 
 
 def fit(f: dict, sample_fn, verbose: bool = False):
     """Coarse-to-fine search over (offset, yaw, base_dy).
 
-    `sample_fn(Px, Py, Pz) -> (views, masks)` does the projection; keeping it a
+    `sample_fn(Px, Py, Pz) -> (views, masks, weights)` does the projection; keeping it a
     callback means this module knows nothing about camera models.
     """
     best = (None, -1.0)
 
     def evaluate(offset, yaw, dy):
         Px, Py, Pz = plane_grid(f, offset, yaw, dy, FIT_PPM, FIT_HEIGHT)
-        views, masks = sample_fn(Px, Py, Pz)
+        views, masks, weights = sample_fn(Px, Py, Pz)
         if len(views) < 3:
             return None, -1.0
         from clean_plate import median_composite
-        plate = median_composite(views, masks)
+        plate = median_composite(views, masks, weights)
         coverage = float(np.mean([m.mean() for m in masks]))
-        score = agreement(views, masks, plate)
+        score = agreement(views, masks, plate, weights)
         if score < 0:
             return None, -1.0
         # Coverage matters as a tiebreak only: a plane that sees more of the
