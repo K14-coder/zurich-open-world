@@ -12,6 +12,8 @@ struct Uniforms {
     var fog: SIMD4<Float>        // rgb + density
     var skyTop: SIMD4<Float>
     var skyHorizon: SIMD4<Float>
+    var orthoExtent: SIMD4<Float>   // minX, minZ, maxX, maxZ
+    var flags: SIMD4<Float>         // x = 1 when the ortho texture is bound
 }
 
 struct Camera {
@@ -38,6 +40,8 @@ final class Renderer {
     private let vertexBuffer: MTLBuffer
     private let indexBuffer: MTLBuffer
     private let indexCount: Int
+    private var ortho: Ortho?
+    private var sampler: MTLSamplerState!
 
     // A hazy Swiss summer afternoon rather than a hard blue sky — haze is what
     // gives a flat city depth, and it hides the edge of the world for free.
@@ -96,6 +100,19 @@ final class Renderer {
         vertexBuffer = vb
         indexBuffer = ib
         indexCount = mesh.indices.count
+
+        let sd2 = MTLSamplerDescriptor()
+        sd2.minFilter = .linear
+        sd2.magFilter = .linear
+        sd2.mipFilter = .linear
+        sd2.sAddressMode = .clampToEdge
+        sd2.tAddressMode = .clampToEdge
+        sd2.maxAnisotropy = 8   // the ground is viewed at a grazing angle constantly
+        sampler = device.makeSamplerState(descriptor: sd2)
+    }
+
+    func loadOrtho(imageURL: URL, metaURL: URL) {
+        ortho = Ortho(imageURL: imageURL, metaURL: metaURL, device: device, queue: queue)
     }
 
     /// Shared by the offscreen renderer and the live view, so what you drive
@@ -111,7 +128,9 @@ final class Renderer {
             cameraPosition: SIMD4(camera.eye, 0),
             fog: SIMD4(skyHorizon, 0.00011),
             skyTop: SIMD4(skyTop, Float(height)),
-            skyHorizon: SIMD4(skyHorizon, 0))
+            skyHorizon: SIMD4(skyHorizon, 0),
+            orthoExtent: ortho?.extent ?? .zero,
+            flags: SIMD4(ortho == nil ? 0 : 1, 0, 0, 0))
 
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
         enc.setRenderPipelineState(skyPipeline)
@@ -125,6 +144,8 @@ final class Renderer {
         enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         enc.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.setFragmentTexture(ortho?.texture, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
         enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
                                   indexType: .uint32, indexBuffer: indexBuffer,
                                   indexBufferOffset: 0)
@@ -214,6 +235,8 @@ final class Renderer {
         float4 fog;         // rgb, density
         float4 skyTop;
         float4 skyHorizon;
+        float4 orthoExtent;
+        float4 flags;
     };
 
     // float3, NOT packed_float3. Swift's SIMD3<Float> is 16-byte aligned, so the
@@ -248,10 +271,34 @@ final class Renderer {
     }
 
     fragment float4 scene_fragment(VOut in [[stage_in]],
-                                   constant Uniforms& u [[buffer(1)]]) {
+                                   constant Uniforms& u [[buffer(1)]],
+                                   texture2d<float> ortho [[texture(0)]],
+                                   sampler orthoSampler [[sampler(0)]]) {
         float3 n = normalize(in.normal);
         float3 sun = normalize(u.sunDirection.xyz);
         float3 albedo = in.colour;
+        float photographic = 0.0;
+
+        // Terrain is the aerial photograph itself — and so are the roofs. The
+        // ortho is a top-down image, so the real roof of every building is
+        // already sitting in it at that XZ. Sampling it there costs nothing and
+        // replaces 12,538 invented flat-brown lids with the actual roofs, tiles,
+        // skylights, courtyards and all.
+        //
+        // It is an approximation: the photo is orthorectified to the ground, so
+        // a tall building leans away from nadir and its roof pixels sit slightly
+        // off. At Zurich's 15 m average that is a metre or two, well below what
+        // you can see from a car.
+        bool photoSurface = (in.material > 2.5)                       // terrain
+                         || (in.material > 1.5 && in.material < 2.5); // roofs
+        if (photoSurface && u.flags.x > 0.5) {
+            float2 uv = float2((in.world.x - u.orthoExtent.x)
+                                 / (u.orthoExtent.z - u.orthoExtent.x),
+                               (in.world.z - u.orthoExtent.y)
+                                 / (u.orthoExtent.w - u.orthoExtent.y));
+            albedo = ortho.sample(orthoSampler, uv).rgb;
+            photographic = 1.0;
+        }
 
         // Procedural facades. Blank extrusions read as cardboard no matter how
         // good the lighting is; a storey rhythm is what makes a box become a
@@ -295,6 +342,11 @@ final class Renderer {
         float3 ambient = mix(float3(0.34, 0.35, 0.34), float3(0.50, 0.56, 0.64), hemi);
 
         float3 lit = albedo * (direct + ambient);
+
+        // An aerial photograph already carries the sun that took it. Lighting it
+        // again doubles the contrast and turns every roof into a highlight, so
+        // fade towards flat albedo for photographic surfaces.
+        lit = mix(lit, albedo * 1.06, photographic * 0.82);
 
         // Cheap specular sheen on near-horizontal surfaces reads as damp tarmac.
         float3 view = normalize(u.cameraPosition.xyz - in.world);

@@ -19,6 +19,10 @@ print("  terrain \(mesh.terrainRange.count / 3), roads \(mesh.roadRange.count / 
 
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
+clock = Date()
+renderer.loadOrtho(imageURL: here.appendingPathComponent("../zurich_ortho.jpg"),
+                   metaURL: here.appendingPathComponent("../zurich_ortho.json"))
+print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
 
 /// Eye point for a driver: on the road, at seat height, looking down the street.
 func driverCamera(street: String, back: Float = 0, lift: Float = 1.35) -> Camera? {

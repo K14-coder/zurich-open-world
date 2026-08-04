@@ -19,6 +19,7 @@ struct Vertex {
         case plain = 0      // terrain, roads
         case wall = 1       // building façades — gets procedural windows
         case roof = 2
+        case ortho = 3      // terrain — sampled from the aerial photograph
     }
 
     init(position: SIMD3<Float>, normal: SIMD3<Float>,
@@ -194,7 +195,7 @@ final class WorldMesh {
                 let steep = Float(max(0, min(1, (0.97 - Double(n.y)) * 12)))
                 colour = mix(colour, rock, t: steep)
                 vertices.append(Vertex(position: SIMD3(Float(x), Float(y), Float(z)),
-                                       normal: n, colour: colour))
+                                       normal: n, colour: colour, material: .ortho))
             }
         }
         for j in 0..<(nz - 1) {

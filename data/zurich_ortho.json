@@ -1,0 +1,11 @@
+{
+  "level": 26,
+  "metresPerPixel": 0.5,
+  "width": 7680,
+  "height": 7168,
+  "worldMinX": -1937.0400000000373,
+  "worldMinZ": -1812.719999999972,
+  "worldMaxX": 1902.9599999999627,
+  "worldMaxZ": 1771.280000000028,
+  "attribution": "SWISSIMAGE (c) swisstopo"
+}
