@@ -1,0 +1,10 @@
+# Swift build products
+.build/
+*.xcodeproj
+
+# Cached Overpass and elevation responses — large, and regenerated on demand
+tools/cache/
+tools/*_raw.json
+*_raw.json
+
+.DS_Store
