@@ -31,7 +31,8 @@ HERE = pathlib.Path(__file__).parent
 
 
 def median_composite(images: list[np.ndarray],
-                     masks: list[np.ndarray] | None = None) -> np.ndarray:
+                     masks: list[np.ndarray] | None = None,
+                     return_coverage: bool = False):
     """Per-pixel median across aligned views.
 
     `masks` optionally marks known-bad pixels (segmented vehicles, or areas the
@@ -43,7 +44,10 @@ def median_composite(images: list[np.ndarray],
     stack = np.stack(images).astype(np.float32)
 
     if masks is None:
-        return np.median(stack, axis=0).astype(np.uint8)
+        out = np.median(stack, axis=0).astype(np.uint8)
+        if return_coverage:
+            return out, np.ones(out.shape[:2], dtype=bool)
+        return out
 
     valid = np.stack(masks).astype(bool)
     out = np.zeros(stack.shape[1:], dtype=np.float32)
@@ -58,7 +62,14 @@ def median_composite(images: list[np.ndarray],
         med = np.nanmedian(filled, axis=0)
     plain = np.median(stack, axis=0)
     out = np.where(any_valid[..., None], np.nan_to_num(med, nan=0.0), plain)
-    return np.clip(out, 0, 255).astype(np.uint8)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    # Where no view had a usable pixel there is nothing to composite. Falling
+    # back to the plain median there is actively wrong: it restores the very
+    # occluder the masks excluded, which is how a permanently parked car
+    # reappeared in the finished plate. Report it as a hole for inpainting.
+    if return_coverage:
+        return out, any_valid
+    return out
 
 
 def occlusion_report(images: list[np.ndarray], result: np.ndarray) -> dict:

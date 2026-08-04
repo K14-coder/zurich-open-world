@@ -31,6 +31,7 @@ import numpy as np
 from PIL import Image
 
 import plane_fit
+import segment
 
 from zurich_circuit import wgs84_to_lv95
 from zurich_world import terrain_at
@@ -112,6 +113,17 @@ def project(cam_pts: np.ndarray, meta: dict) -> tuple[np.ndarray, np.ndarray]:
     valid = (Z > 0.1) & np.isfinite(px) & np.isfinite(py)
     valid &= (px >= 0) & (px < w - 1) & (py >= 0) & (py < h - 1)
     return np.stack([px, py], axis=-1), valid
+
+
+def sample_nearest(mask: np.ndarray, px: np.ndarray, py: np.ndarray) -> np.ndarray:
+    """Nearest-neighbour lookup for a boolean mask; interpolating a mask would
+    invent half-occluded pixels that are neither."""
+    h, w = mask.shape
+    px = np.nan_to_num(px, nan=0.0, posinf=0.0, neginf=0.0)
+    py = np.nan_to_num(py, nan=0.0, posinf=0.0, neginf=0.0)
+    xi = np.clip(np.round(px).astype(np.int32), 0, w - 1)
+    yi = np.clip(np.round(py).astype(np.int32), 0, h - 1)
+    return mask[yi, xi]
 
 
 def sample_bilinear(img: np.ndarray, px: np.ndarray, py: np.ndarray) -> np.ndarray:
@@ -315,8 +327,18 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
         lon, lat = meta["computed_geometry"]["coordinates"]
         east, north = wgs84_to_lv95(lat, lon)
         cx, cz = east - e0, -(north - n0)
+        # Segment once per photograph, not once per candidate plane: the plane
+        # search evaluates hundreds of poses against these same frames.
+        try:
+            facade = segment.facade_mask(pixels.astype(np.uint8), cache_key=meta["id"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"    ! segmentation failed for {meta['id']}: {exc}", file=sys.stderr)
+            facade = np.ones(pixels.shape[:2], dtype=bool)
+        import cv2 as _cv2
+        eroded = _cv2.erode(facade.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
         prepared.append({
-            "meta": meta, "pixels": pixels,
+            "meta": meta, "pixels": pixels, "facade": facade,
+            "facade_eroded": eroded,
             "R": rodrigues(meta["computed_rotation"]),
             "cx": cx, "cz": cz,
             "cy": terrain_at(grid, cx, cz) + CAMERA_HEIGHT,
@@ -337,8 +359,13 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
             shot = np.clip(s, 0, 255).astype(np.uint8)
             if looks_like_sky(shot, valid) > 0.35:
                 continue
+            # Carry the segmentation through the same projection. A pixel only
+            # votes if the model called it façade in the source photograph, so a
+            # parked car is excluded from the median rather than outvoted by it
+            # — which is what makes three or four views enough.
+            keep = sample_nearest(p["facade_eroded"], pxpy[..., 0], pxpy[..., 1])
             views.append(shot)
-            masks.append(valid)
+            masks.append(valid & keep)
         return views, masks
 
     params, score = plane_fit.fit(f, sample, verbose=True)
@@ -355,8 +382,19 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
 
     raw_first = views[0]
     views, masks, aligned = align_views(views, masks)
-    plate = median_composite(views, masks)
-    return (plate, raw_first, aligned, params, score), len(views)
+    views = match_exposure(views, masks)
+    plate, covered = median_composite(views, masks, return_coverage=True)
+
+    # Anything permanently occluded in every pass -- a car that never moved --
+    # was never photographed, so it has to be reconstructed rather than
+    # composited. Inpainting from the surrounding façade is the honest option.
+    holes = (~covered).astype(np.uint8)
+    hole_fraction = float(holes.mean())
+    if holes.any():
+        import cv2
+        plate = cv2.inpaint(plate, cv2.dilate(holes, np.ones((3, 3), np.uint8)),
+                            5, cv2.INPAINT_TELEA)
+    return (plate, raw_first, aligned, params, score, hole_fraction), len(views)
 
 
 def phase_shift(ref: np.ndarray, img: np.ndarray, max_shift: float = 0.18):
@@ -392,6 +430,41 @@ def phase_shift(ref: np.ndarray, img: np.ndarray, max_shift: float = 0.18):
     if dx > w // 2:
         dx -= w
     return int(dy), int(dx)
+
+
+def match_exposure(views: list, masks: list) -> list:
+    """Normalise each view to a common exposure and white balance.
+
+    The passes are years apart — different seasons, weather and times of day —
+    so the same wall arrives at noticeably different brightness and colour cast
+    in each. Compositing them raw produces a patchwork that reads as blotches
+    rather than as a building. Matching per-channel mean and standard deviation
+    against the reference is crude but sufficient, and unlike a full histogram
+    match it cannot invent contrast that was never there.
+    """
+    ref_i = int(np.argmax([m.mean() for m in masks]))
+    ref = views[ref_i].astype(np.float32)
+    rm = masks[ref_i]
+    if rm.sum() < 64:
+        return views
+
+    out = []
+    for i, (v, m) in enumerate(zip(views, masks)):
+        both = m & rm
+        if i == ref_i or both.sum() < 200:
+            out.append(v)
+            continue
+        f = v.astype(np.float32)
+        adjusted = f.copy()
+        for ch in range(3):
+            rs, vs = ref[..., ch][both], f[..., ch][both]
+            rsd, vsd = rs.std(), vs.std()
+            if vsd < 1e-3:
+                continue
+            gain = float(np.clip(rsd / vsd, 0.6, 1.6))
+            adjusted[..., ch] = (f[..., ch] - vs.mean()) * gain + rs.mean()
+        out.append(np.clip(adjusted, 0, 255).astype(np.uint8))
+    return out
 
 
 def align_views(views: list, masks: list):
@@ -490,7 +563,7 @@ def main() -> None:
         if result is None:
             print(f"    façade {i}: only {n} usable views, skipped")
             continue
-        plate, raw_first, aligned, params, score = result
+        plate, raw_first, aligned, params, score, holes = result
         Image.fromarray(plate).save(out_dir / f"facade_{i:02d}_plate.jpg", quality=92)
         # Side by side with a single raw view, so the effect is visible.
         strip = Image.new("RGB", (plate.shape[1] * 2, plate.shape[0]))
@@ -499,7 +572,8 @@ def main() -> None:
         strip.save(out_dir / f"facade_{i:02d}_compare.jpg", quality=92)
         made.append((i, f, n))
         print(f"    façade {i}: {n} views ({aligned} refined) -> "
-              f"{plate.shape[1]}x{plate.shape[0]} plate  ({f['len']:.1f} m wide)")
+              f"{plate.shape[1]}x{plate.shape[0]} plate, {holes*100:.0f}% inpainted"
+              f"  ({f['len']:.1f} m wide)")
 
     if made:
         print(f"\n  wrote {len(made)} plates to {out_dir}")
