@@ -9,3 +9,8 @@ tools/*_raw.json
 
 .DS_Store
 tools/cache/
+
+# Never commit credentials
+*token*
+*secret*
+.env
