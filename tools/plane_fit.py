@@ -79,6 +79,39 @@ def highpass(g: np.ndarray) -> np.ndarray:
     return g - cv2.GaussianBlur(g, (0, 0), 2.0)
 
 
+def quad_corners(f: dict, offset: float, yaw: float, base_dy: float,
+                 height: float) -> list:
+    """World-space corners of the fitted plane, for the renderer to hang the
+    finished plate on. Returned bottom-left, bottom-right, top-left, top-right
+    in the same parameterisation `plane_grid` samples."""
+    ax, az = f["a"]
+    bx, bz = f["z"]
+    nx, nz = f["n"]
+    mx, mz = (ax + bx) / 2, (az + bz) / 2
+    c, s = math.cos(yaw), math.sin(yaw)
+
+    def rot(px, pz):
+        dx, dz = px - mx, pz - mz
+        return mx + dx * c - dz * s, mz + dx * s + dz * c
+
+    ax2, az2 = rot(ax, az)
+    bx2, bz2 = rot(bx, bz)
+    nx2 = nx * c - nz * s
+    nz2 = nx * s + nz * c
+    # Nudge towards the street so the plate sits in front of the extruded wall
+    # rather than co-planar with it, which would z-fight.
+    push = 0.06
+    ax2 += nx2 * (offset + push); az2 += nz2 * (offset + push)
+    bx2 += nx2 * (offset + push); bz2 += nz2 * (offset + push)
+
+    y0 = f["base"] + base_dy
+    y1 = y0 + height
+    return [[round(ax2, 3), round(y0, 3), round(az2, 3)],
+            [round(bx2, 3), round(y0, 3), round(bz2, 3)],
+            [round(ax2, 3), round(y1, 3), round(az2, 3)],
+            [round(bx2, 3), round(y1, 3), round(bz2, 3)]]
+
+
 def agreement(views: list, masks: list, plate: np.ndarray,
               weights: list | None = None) -> float:
     """Mean normalised cross-correlation of each view against the composite.

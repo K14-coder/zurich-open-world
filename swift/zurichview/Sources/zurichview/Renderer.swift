@@ -42,6 +42,7 @@ final class Renderer {
     private let shadowCasterRange: Range<Int>
     private var ortho: Ortho?
     private var materials: Materials?
+    private var facadeAtlas: MTLTexture?
     private var sampler: MTLSamplerState!
     private var shadowSampler: MTLSamplerState!
     private let shadowMap: MTLTexture
@@ -158,6 +159,35 @@ final class Renderer {
     }
 
     @discardableResult
+    func loadFacadeAtlas(url: URL) -> Bool {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
+        let w = img.width, h = img.height
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(data: &pixels, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm_srgb, width: w, height: h, mipmapped: true)
+        desc.usage = [.shaderRead]
+        desc.storageMode = .managed
+        guard let tex = device.makeTexture(descriptor: desc) else { return false }
+        tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
+                    withBytes: pixels, bytesPerRow: w * 4)
+        if let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() {
+            blit.generateMipmaps(for: tex)
+            blit.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+        }
+        facadeAtlas = tex
+        return true
+    }
+
+    @discardableResult
     func loadMaterials(directory: URL) -> Bool {
         materials = Materials(directory: directory, device: device, queue: queue)
         return materials != nil
@@ -238,6 +268,7 @@ final class Renderer {
         enc.setFragmentTexture(materials?.albedo, index: 2)
         enc.setFragmentTexture(materials?.normal, index: 3)
         enc.setFragmentTexture(materials?.roughness, index: 4)
+        enc.setFragmentTexture(facadeAtlas, index: 5)
         enc.setFragmentSamplerState(sampler, index: 0)
         enc.setFragmentSamplerState(shadowSampler, index: 1)
         enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
@@ -518,6 +549,7 @@ final class Renderer {
                                    texture2d_array<float> matAlbedo [[texture(2)]],
                                    texture2d_array<float> matNormal [[texture(3)]],
                                    texture2d_array<float> matRough [[texture(4)]],
+                                   texture2d<float> facadeAtlas [[texture(5)]],
                                    sampler orthoSampler [[sampler(0)]],
                                    sampler shadowSampler [[sampler(1)]]) {
         float3 n = normalize(in.normal);
@@ -569,6 +601,13 @@ final class Renderer {
                 albedo = albedo * (tex / lum);
             }
             albedo = facade(albedo, in.world, n, in.params, viewDir, u, gloss);
+        } else if (in.material > 5.5) {
+            // Photographic façade. The plate already contains the building's own
+            // shading from the day it was photographed, so it is lit only
+            // lightly — relighting it would double every shadow, exactly as with
+            // the aerial orthophoto.
+            albedo = facadeAtlas.sample(orthoSampler, in.params.xy).rgb;
+            photographic = 1.0;
         } else if (in.material > 3.5 && in.material < 4.5) {
             // Foliage.
             //

@@ -405,7 +405,7 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
     raw_first = views[0]
     views, masks, aligned = align_views(views, masks)
     views = match_exposure(views, masks)
-    plate, covered = median_composite(views, masks, weights, return_coverage=True)
+    plate, covered = best_view_composite(views, masks, weights)
 
     # Anything permanently occluded in every pass -- a car that never moved --
     # was never photographed, so it has to be reconstructed rather than
@@ -452,6 +452,36 @@ def phase_shift(ref: np.ndarray, img: np.ndarray, max_shift: float = 0.18):
     if dx > w // 2:
         dx -= w
     return int(dy), int(dx)
+
+
+def best_view_composite(views: list, masks: list, weights: list):
+    """One sharp view as the base; other views patch only what it could not see.
+
+    A median across every view is the wrong tool here. It spreads the residual
+    misregistration of seven photographs across the whole façade, so even a
+    perfect plane fit yields something softer than any single input — and the
+    single inputs are already sharp enough to read shutter slats and signage.
+
+    So take the best view whole, and fall back to the others only where it is
+    occluded: behind a parked car, mostly. Misregistration then costs blur only
+    inside those patches, which are a small fraction of the wall, instead of
+    over all of it.
+    """
+    score = [w * float(m.mean()) for w, m in zip(weights, masks)]
+    base_i = int(np.argmax(score))
+    plate = views[base_i].copy()
+    covered = masks[base_i].copy()
+
+    order = sorted(range(len(views)), key=lambda i: -score[i])
+    for i in order:
+        if i == base_i:
+            continue
+        gap = (~covered) & masks[i]
+        if not gap.any():
+            continue
+        plate[gap] = views[i][gap]
+        covered |= gap
+    return plate, covered
 
 
 def match_exposure(views: list, masks: list) -> list:
@@ -579,6 +609,7 @@ def main() -> None:
     out_dir = HERE.parent / "images" / "facades"
     out_dir.mkdir(parents=True, exist_ok=True)
     made = []
+    index = []
 
     for i, f in enumerate(targets):
         result, n = rectify_facade(f, images, grid, e0, n0, tok, occluders)
@@ -586,6 +617,16 @@ def main() -> None:
             print(f"    façade {i}: only {n} usable views, skipped")
             continue
         plate, raw_first, aligned, params, score, holes = result
+        offset, yaw, base_dy = params
+        height = min(f["h"], plane_fit.FIT_HEIGHT)
+        corners = plane_fit.quad_corners(f, offset, yaw, base_dy, height)
+        index.append({
+            "file": f"facade_{i:02d}_plate.jpg",
+            "corners": corners,          # bottom-left, bottom-right, top-left, top-right
+            "road": f["road"],
+            "holes": round(holes, 3),
+            "views": n,
+        })
         Image.fromarray(plate).save(out_dir / f"facade_{i:02d}_plate.jpg", quality=92)
         # Side by side with a single raw view, so the effect is visible.
         strip = Image.new("RGB", (plate.shape[1] * 2, plate.shape[0]))
@@ -597,6 +638,8 @@ def main() -> None:
               f"{plate.shape[1]}x{plate.shape[0]} plate, {holes*100:.0f}% inpainted"
               f"  ({f['len']:.1f} m wide)")
 
+    if index:
+        (out_dir / "plates.json").write_text(json.dumps({"plates": index}, indent=1))
     if made:
         print(f"\n  wrote {len(made)} plates to {out_dir}")
     else:

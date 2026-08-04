@@ -26,6 +26,7 @@ struct Vertex {
         case ortho = 3      // terrain and pavement — from the aerial photograph
         case foliage = 4    // tree canopy
         case road = 5       // carriageway — gets asphalt treatment
+        case plate = 6      // photographic façade from street imagery
     }
 
     init(position: SIMD3<Float>, normal: SIMD3<Float>,
@@ -48,6 +49,7 @@ final class WorldMesh {
     private(set) var roadRange: Range<Int> = 0..<0
     private(set) var buildingRange: Range<Int> = 0..<0
     private(set) var streetscapeRange: Range<Int> = 0..<0
+    private(set) var plateRange: Range<Int> = 0..<0
 
     private let terrain: TerrainGrid
     private var storedEdges: [WorldJSON.Edge] = []
@@ -345,6 +347,7 @@ final class WorldMesh {
     func terrainHeight(x: Double, z: Double) -> Double { terrain.height(x: x, z: z) }
 
     func setStreetscapeRange(_ r: Range<Int>) { streetscapeRange = r }
+    func setPlateRange(_ r: Range<Int>) { plateRange = r }
     var roadEdgesForPavement: [WorldJSON.Edge] { storedEdges }
 }
 

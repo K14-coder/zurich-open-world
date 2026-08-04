@@ -38,6 +38,9 @@ print(String(format: "Streetscape built in %.2f s — %d triangles",
              -clock.timeIntervalSinceNow, mesh.streetscapeRange.count / 3))
 print("  total \(mesh.indices.count / 3) triangles")
 
+let plateCount = mesh.buildPlates(url: locate("facade_atlas.json"))
+print("Photographic façades: \(plateCount) plates")
+
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
 clock = Date()
@@ -45,6 +48,11 @@ renderer.loadOrtho(imageURL: orthoImageURL, metaURL: orthoMetaURL)
 print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
 clock = Date()
 let materialsDir = worldURL.deletingLastPathComponent().appendingPathComponent("materials")
+if renderer.loadFacadeAtlas(url: locate("facade_atlas.jpg")) {
+    print("Façade atlas loaded")
+} else {
+    print("Façade atlas NOT loaded")
+}
 if renderer.loadMaterials(directory: materialsDir) {
     print(String(format: "PBR materials loaded in %.2f s", -clock.timeIntervalSinceNow))
 } else {
@@ -93,6 +101,12 @@ shots.append(Shot(
     name: "hottingen-low",
     camera: Camera(eye: SIMD3(1280, 55, 820), target: SIMD3(1560, 25, 430), fovDegrees: 55),
     note: "low over Freiestrasse"))
+
+shots.append(Shot(
+    name: "plates",
+    camera: Camera(eye: SIMD3(1536.6, 37.8, 546.3),
+                   target: SIMD3(1542.9, 42.0, 555.3), fovDegrees: 62),
+    note: "photographic façades"))
 
 let width = 1400, height = 850
 for shot in shots {

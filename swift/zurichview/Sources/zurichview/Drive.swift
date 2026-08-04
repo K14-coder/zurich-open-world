@@ -50,11 +50,56 @@ final class DriveView: MTKView, MTKViewDelegate {
     override func keyUp(with event: NSEvent) { held.remove(event.keyCode) }
 
     private func respawn(on street: String) {
-        if let spawn = network.spawn(on: street) {
+        // Prefer standing in front of the photographic façades: they are the
+        // point of the exercise and they occupy a few hundred metres of one
+        // street, so spawning at the street's midpoint usually misses them.
+        if let spot = Self.plateViewpoint() {
+            position = SIMD3(spot.x, 0, spot.z)
+            heading = spot.yaw
+        } else if let spawn = network.spawn(on: street) {
             position = spawn.position
             heading = spawn.yaw
         }
         speed = 0
+    }
+
+    /// A point on the road in front of a plated façade, facing it.
+    static func plateViewpoint() -> (x: Double, z: Double, yaw: Double)? {
+        guard let url = try? plateURL(),
+              let data = try? Data(contentsOf: url),
+              let atlas = try? JSONDecoder().decode(WorldMesh.AtlasJSON.self, from: data),
+              !atlas.plates.isEmpty else { return nil }
+
+        // Widest plate that is still plausibly a single building.
+        let ranked = atlas.plates.compactMap { p -> (Double, WorldMesh.AtlasJSON.Plate)? in
+            guard p.corners.count == 4, p.corners[0].count == 3 else { return nil }
+            let a = p.corners[0], b = p.corners[1]
+            let w = ((b[0] - a[0]) * (b[0] - a[0]) + (b[2] - a[2]) * (b[2] - a[2])).squareRoot()
+            return (w, p)
+        }.filter { $0.0 > 6 && $0.0 < 20 }.sorted { $0.0 > $1.0 }
+        guard let chosen = ranked.first?.1 else { return nil }
+
+        let a = chosen.corners[0], b = chosen.corners[1]
+        let mx = (a[0] + b[0]) / 2, mz = (a[2] + b[2]) / 2
+        var ex = b[0] - a[0], ez = b[2] - a[2]
+        let len = (ex * ex + ez * ez).squareRoot()
+        guard len > 1e-6 else { return nil }
+        ex /= len; ez /= len
+        let nx = -ez, nz = ex           // matches the winding Plates.swift uses
+        let stand = 10.0
+        let px = mx + nx * stand, pz = mz + nz * stand
+        // Face back towards the wall.
+        let dx = mx - px, dz = mz - pz
+        return (px, pz, atan2(dx, -dz))
+    }
+
+    private static func plateURL() throws -> URL {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for c in ["..", "../..", "../../data", "../data", "data", "."] {
+            let u = cwd.appendingPathComponent(c).appendingPathComponent("facade_atlas.json")
+            if FileManager.default.fileExists(atPath: u.path) { return u.standardized }
+        }
+        throw Fail("no atlas")
     }
 
     private var forward: SIMD3<Double> {
