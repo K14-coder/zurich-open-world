@@ -7,13 +7,14 @@ import UniformTypeIdentifiers
 
 struct Uniforms {
     var viewProj: simd_float4x4
+    var lightViewProj: simd_float4x4
     var sunDirection: SIMD4<Float>
     var cameraPosition: SIMD4<Float>
-    var fog: SIMD4<Float>        // rgb + density
+    var fog: SIMD4<Float>           // rgb + density
     var skyTop: SIMD4<Float>
     var skyHorizon: SIMD4<Float>
     var orthoExtent: SIMD4<Float>   // minX, minZ, maxX, maxZ
-    var flags: SIMD4<Float>         // x = 1 when the ortho texture is bound
+    var flags: SIMD4<Float>         // x = ortho bound, y = viewport height
 }
 
 struct Camera {
@@ -24,30 +25,40 @@ struct Camera {
     var far: Float = 6000
 }
 
-/// Draws the world offscreen. There is no window here on purpose: a headless
-/// render is reproducible, needs no display, and is the only way to check what
-/// the city actually looks like from inside an automated build.
+/// Draws the world, offscreen or into a live view through the same path, so what
+/// you drive through and what gets written to a PNG are the same picture.
 final class Renderer {
-    var metalDevice: MTLDevice { device }
-    var commandQueue: MTLCommandQueue { queue }
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let scenePipeline: MTLRenderPipelineState
     private let skyPipeline: MTLRenderPipelineState
+    private let shadowPipeline: MTLRenderPipelineState
     private let sceneDepth: MTLDepthStencilState
     private let skyDepth: MTLDepthStencilState
 
     private let vertexBuffer: MTLBuffer
     private let indexBuffer: MTLBuffer
     private let indexCount: Int
+    private let shadowCasterRange: Range<Int>
     private var ortho: Ortho?
     private var sampler: MTLSamplerState!
+    private var shadowSampler: MTLSamplerState!
+    private let shadowMap: MTLTexture
 
-    // A hazy Swiss summer afternoon rather than a hard blue sky — haze is what
-    // gives a flat city depth, and it hides the edge of the world for free.
-    private let skyTop = SIMD3<Float>(0.32, 0.50, 0.74)
-    private let skyHorizon = SIMD3<Float>(0.76, 0.82, 0.88)
-    private let sunDirection = normalize(SIMD3<Float>(-0.45, 0.72, 0.52))
+    var metalDevice: MTLDevice { device }
+    var commandQueue: MTLCommandQueue { queue }
+
+    static let sampleCount = 4
+    /// Half-extent of the shadow cascade, metres. One cascade is enough because
+    /// a driver never sees far before a building occludes the view.
+    private let shadowRadius: Float = 340
+    private let shadowResolution = 4096
+
+    // A hazy summer afternoon rather than a hard blue sky — haze gives a flat
+    // city depth, and hides the edge of the world for free.
+    private let skyTop = SIMD3<Float>(0.28, 0.46, 0.72)
+    private let skyHorizon = SIMD3<Float>(0.74, 0.81, 0.88)
+    private let sunDirection = normalize(SIMD3<Float>(-0.42, 0.62, 0.55))
 
     init(mesh: WorldMesh) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -58,26 +69,35 @@ final class Renderer {
         self.queue = queue
 
         let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
-        guard let vfn = library.makeFunction(name: "scene_vertex"),
-              let ffn = library.makeFunction(name: "scene_fragment"),
-              let skyV = library.makeFunction(name: "sky_vertex"),
-              let skyF = library.makeFunction(name: "sky_fragment") else {
-            throw Fail("shader functions missing")
+        func fn(_ name: String) throws -> MTLFunction {
+            guard let f = library.makeFunction(name: name) else {
+                throw Fail("shader function \(name) missing")
+            }
+            return f
         }
 
         let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vfn
-        desc.fragmentFunction = ffn
+        desc.vertexFunction = try fn("scene_vertex")
+        desc.fragmentFunction = try fn("scene_fragment")
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
         desc.depthAttachmentPixelFormat = .depth32Float
+        desc.rasterSampleCount = Self.sampleCount
         scenePipeline = try device.makeRenderPipelineState(descriptor: desc)
 
         let skyDesc = MTLRenderPipelineDescriptor()
-        skyDesc.vertexFunction = skyV
-        skyDesc.fragmentFunction = skyF
+        skyDesc.vertexFunction = try fn("sky_vertex")
+        skyDesc.fragmentFunction = try fn("sky_fragment")
         skyDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
         skyDesc.depthAttachmentPixelFormat = .depth32Float
+        skyDesc.rasterSampleCount = Self.sampleCount
         skyPipeline = try device.makeRenderPipelineState(descriptor: skyDesc)
+
+        let shDesc = MTLRenderPipelineDescriptor()
+        shDesc.vertexFunction = try fn("shadow_vertex")
+        shDesc.fragmentFunction = nil          // depth only
+        shDesc.depthAttachmentPixelFormat = .depth32Float
+        shDesc.rasterSampleCount = 1
+        shadowPipeline = try device.makeRenderPipelineState(descriptor: shDesc)
 
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
@@ -88,6 +108,16 @@ final class Renderer {
         sd.depthCompareFunction = .always
         sd.isDepthWriteEnabled = false
         skyDepth = device.makeDepthStencilState(descriptor: sd)!
+
+        let smd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float, width: shadowResolution,
+            height: shadowResolution, mipmapped: false)
+        smd.usage = [.renderTarget, .shaderRead]
+        smd.storageMode = .private
+        guard let sm = device.makeTexture(descriptor: smd) else {
+            throw Fail("no shadow map")
+        }
+        shadowMap = sm
 
         guard let vb = device.makeBuffer(bytes: mesh.vertices,
                                          length: MemoryLayout<Vertex>.stride * mesh.vertices.count,
@@ -100,6 +130,10 @@ final class Renderer {
         vertexBuffer = vb
         indexBuffer = ib
         indexCount = mesh.indices.count
+        // Only buildings cast. Flat ground writing itself into the shadow map is
+        // pure self-shadowing acne — it turned every road pitch black — and a
+        // level city gains nothing from terrain casting onto terrain.
+        shadowCasterRange = mesh.buildingRange
 
         let sd2 = MTLSamplerDescriptor()
         sd2.minFilter = .linear
@@ -107,31 +141,77 @@ final class Renderer {
         sd2.mipFilter = .linear
         sd2.sAddressMode = .clampToEdge
         sd2.tAddressMode = .clampToEdge
-        sd2.maxAnisotropy = 8   // the ground is viewed at a grazing angle constantly
+        sd2.maxAnisotropy = 16   // the ground is viewed at a grazing angle constantly
         sampler = device.makeSamplerState(descriptor: sd2)
+
+        let sd3 = MTLSamplerDescriptor()
+        sd3.minFilter = .linear
+        sd3.magFilter = .linear
+        sd3.sAddressMode = .clampToEdge
+        sd3.tAddressMode = .clampToEdge
+        shadowSampler = device.makeSamplerState(descriptor: sd3)
     }
 
     func loadOrtho(imageURL: URL, metaURL: URL) {
         ortho = Ortho(imageURL: imageURL, metaURL: metaURL, device: device, queue: queue)
     }
 
-    /// Shared by the offscreen renderer and the live view, so what you drive
-    /// through and what gets written to a PNG are the same picture.
+    // MARK: - Encoding
+
+    private func lightMatrix(camera: Camera) -> simd_float4x4 {
+        // Centre the cascade a little ahead of the camera: everything behind the
+        // driver is off screen, so spending shadow texels on it is waste.
+        let ahead = normalize(camera.target - camera.eye)
+        let centre = camera.eye + ahead * (shadowRadius * 0.55)
+        let lightPos = centre + sunDirection * 900
+        let view = lookAt(eye: lightPos, target: centre, up: SIMD3(0, 0, 1))
+        let proj = orthographic(left: -shadowRadius, right: shadowRadius,
+                                bottom: -shadowRadius, top: shadowRadius,
+                                near: 1, far: 2200)
+        return proj * view
+    }
+
+    /// Shared by the offscreen renderer and the live view.
     func encode(camera: Camera, pass: MTLRenderPassDescriptor,
                 width: Int, height: Int, into cb: MTLCommandBuffer) {
-        let aspect = Float(width) / Float(max(1, height))
         var uniforms = Uniforms(
-            viewProj: perspective(fov: camera.fovDegrees * .pi / 180, aspect: aspect,
+            viewProj: perspective(fov: camera.fovDegrees * .pi / 180,
+                                  aspect: Float(width) / Float(max(1, height)),
                                   near: camera.near, far: camera.far)
                       * lookAt(eye: camera.eye, target: camera.target),
+            lightViewProj: lightMatrix(camera: camera),
             sunDirection: SIMD4(sunDirection, 0),
             cameraPosition: SIMD4(camera.eye, 0),
-            fog: SIMD4(skyHorizon, 0.00011),
-            skyTop: SIMD4(skyTop, Float(height)),
+            fog: SIMD4(skyHorizon, 0.00007),
+            skyTop: SIMD4(skyTop, 0),
             skyHorizon: SIMD4(skyHorizon, 0),
             orthoExtent: ortho?.extent ?? .zero,
-            flags: SIMD4(ortho == nil ? 0 : 1, 0, 0, 0))
+            flags: SIMD4(ortho == nil ? 0 : 1, Float(height), 0, 0))
 
+        // --- Shadow pass ---
+        let shadowPass = MTLRenderPassDescriptor()
+        shadowPass.depthAttachment.texture = shadowMap
+        shadowPass.depthAttachment.loadAction = .clear
+        shadowPass.depthAttachment.storeAction = .store
+        shadowPass.depthAttachment.clearDepth = 1.0
+
+        if let se = cb.makeRenderCommandEncoder(descriptor: shadowPass) {
+            se.setRenderPipelineState(shadowPipeline)
+            se.setDepthStencilState(sceneDepth)
+            // Front-face culling in the depth pass pushes acne behind surfaces
+            // rather than across them; the slope bias mops up the rest.
+            se.setCullMode(.front)
+            se.setDepthBias(0.0015, slopeScale: 2.0, clamp: 0.01)
+            se.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            se.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+            se.drawIndexedPrimitives(
+                type: .triangle, indexCount: shadowCasterRange.count,
+                indexType: .uint32, indexBuffer: indexBuffer,
+                indexBufferOffset: shadowCasterRange.lowerBound * MemoryLayout<UInt32>.stride)
+            se.endEncoding()
+        }
+
+        // --- Main pass ---
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
         enc.setRenderPipelineState(skyPipeline)
         enc.setDepthStencilState(skyDepth)
@@ -145,35 +225,50 @@ final class Renderer {
         enc.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentTexture(ortho?.texture, index: 0)
+        enc.setFragmentTexture(shadowMap, index: 1)
         enc.setFragmentSamplerState(sampler, index: 0)
+        enc.setFragmentSamplerState(shadowSampler, index: 1)
         enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
                                   indexType: .uint32, indexBuffer: indexBuffer,
                                   indexBufferOffset: 0)
         enc.endEncoding()
     }
 
-    func render(camera: Camera, width: Int, height: Int) throws -> CGImage {
-        let cd = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
-        cd.usage = [.renderTarget, .shaderRead]
-        cd.storageMode = .managed
-        guard let colour = device.makeTexture(descriptor: cd) else {
-            throw Fail("no colour target")
-        }
+    // MARK: - Offscreen
 
-        let dd = MTLTextureDescriptor.texture2DDescriptor(
+    func render(camera: Camera, width: Int, height: Int) throws -> CGImage {
+        let msaaDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        msaaDesc.textureType = .type2DMultisample
+        msaaDesc.sampleCount = Self.sampleCount
+        msaaDesc.usage = .renderTarget
+        msaaDesc.storageMode = .private
+
+        let resolveDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        resolveDesc.usage = [.renderTarget, .shaderRead]
+        resolveDesc.storageMode = .managed
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
-        dd.usage = .renderTarget
-        dd.storageMode = .private
-        guard let depth = device.makeTexture(descriptor: dd) else {
-            throw Fail("no depth target")
+        depthDesc.textureType = .type2DMultisample
+        depthDesc.sampleCount = Self.sampleCount
+        depthDesc.usage = .renderTarget
+        depthDesc.storageMode = .private
+
+        guard let msaa = device.makeTexture(descriptor: msaaDesc),
+              let resolve = device.makeTexture(descriptor: resolveDesc),
+              let depth = device.makeTexture(descriptor: depthDesc) else {
+            throw Fail("could not make render targets")
         }
 
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = colour
+        pass.colorAttachments[0].texture = msaa
+        pass.colorAttachments[0].resolveTexture = resolve
         pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].storeAction = .store
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0.76, green: 0.82, blue: 0.88, alpha: 1)
+        pass.colorAttachments[0].storeAction = .multisampleResolve
+        pass.colorAttachments[0].clearColor =
+            MTLClearColor(red: 0.74, green: 0.81, blue: 0.88, alpha: 1)
         pass.depthAttachment.texture = depth
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.storeAction = .dontCare
@@ -181,15 +276,13 @@ final class Renderer {
 
         guard let cb = queue.makeCommandBuffer() else { throw Fail("no command buffer") }
         encode(camera: camera, pass: pass, width: width, height: height, into: cb)
-
         if let blit = cb.makeBlitCommandEncoder() {
-            blit.synchronize(resource: colour)
+            blit.synchronize(resource: resolve)
             blit.endEncoding()
         }
         cb.commit()
         cb.waitUntilCompleted()
-
-        return try image(from: colour, width: width, height: height)
+        return try image(from: resolve, width: width, height: height)
     }
 
     private func image(from texture: MTLTexture, width: Int, height: Int) throws -> CGImage {
@@ -230,22 +323,24 @@ final class Renderer {
 
     struct Uniforms {
         float4x4 viewProj;
+        float4x4 lightViewProj;
         float4 sunDirection;
         float4 cameraPosition;
-        float4 fog;         // rgb, density
+        float4 fog;
         float4 skyTop;
         float4 skyHorizon;
         float4 orthoExtent;
-        float4 flags;
+        float4 flags;       // x = ortho bound, y = viewport height
     };
 
-    // float3, NOT packed_float3. Swift's SIMD3<Float> is 16-byte aligned, so the
-    // Swift Vertex is 48 bytes; packed_float3 here would make this 36 and the
-    // shader would read every vertex from the wrong offset.
+    // float3, NOT packed_float3: SIMD3<Float> is 16-byte aligned in Swift, so
+    // this struct is 64 bytes. packed_float3 would make it 52 and every vertex
+    // would be read from the wrong offset.
     struct Vertex {
         float3 position;
         float3 normal;
-        float4 colour;   // rgb + material id in w
+        float4 colour;   // rgb + material id
+        float4 params;   // building base, storey height, seed, building height
     };
 
     struct VOut {
@@ -254,43 +349,172 @@ final class Renderer {
         float3 normal;
         float3 colour;
         float material;
+        float4 params;
     };
 
     vertex VOut scene_vertex(uint vid [[vertex_id]],
                              device const Vertex* verts [[buffer(0)]],
                              constant Uniforms& u [[buffer(1)]]) {
         Vertex v = verts[vid];
-        float3 p = float3(v.position);
         VOut o;
-        o.clip = u.viewProj * float4(p, 1.0);
-        o.world = p;
-        o.normal = float3(v.normal);
+        o.clip = u.viewProj * float4(v.position, 1.0);
+        o.world = v.position;
+        o.normal = v.normal;
         o.colour = v.colour.xyz;
         o.material = v.colour.w;
+        o.params = v.params;
         return o;
+    }
+
+    vertex float4 shadow_vertex(uint vid [[vertex_id]],
+                                device const Vertex* verts [[buffer(0)]],
+                                constant Uniforms& u [[buffer(1)]]) {
+        return u.lightViewProj * float4(verts[vid].position, 1.0);
+    }
+
+    static inline float hash11(float n) {
+        return fract(sin(n * 12.9898) * 43758.5453);
+    }
+
+    /// Fraction of the sun reaching this point. 3x3 PCF over the cascade.
+    static float sunVisibility(float3 world, float ndl,
+                               constant Uniforms& u,
+                               depth2d<float> shadowMap, sampler smp) {
+        float4 lp = u.lightViewProj * float4(world, 1.0);
+        float3 proj = lp.xyz / lp.w;
+        float2 uv = float2(proj.x * 0.5 + 0.5, -proj.y * 0.5 + 0.5);
+        if (uv.x < 0.001 || uv.x > 0.999 || uv.y < 0.001 || uv.y > 0.999) return 1.0;
+
+        // Steeply-lit surfaces need more bias or they shadow themselves.
+        float bias = mix(0.0016, 0.0003, ndl);
+        float texel = 1.0 / 4096.0;
+        float lit = 0.0;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                float d = shadowMap.sample(smp, uv + float2(i, j) * texel);
+                lit += (proj.z - bias <= d) ? 1.0 : 0.0;
+            }
+        }
+        return lit / 9.0;
+    }
+
+    /// A Zurich façade, synthesized.
+    ///
+    /// Street-level photography cannot be used here — it is full of parked cars
+    /// and people, which is exactly what this world is meant to be without. So
+    /// the façade is built rather than photographed: storey rhythm keyed to the
+    /// building's own base, recessed windows with frames and sills, glass that
+    /// reflects the sky, a stone plinth, a cornice, and vertical weathering.
+    static float3 facade(float3 albedo, float3 world, float3 n, float4 params,
+                         float3 viewDir, constant Uniforms& u, thread float& gloss) {
+        float base   = params.x;
+        float storey = max(2.4, params.y);
+        float seed   = params.z;
+        float total  = max(3.0, params.w);
+
+        float h = world.y - base;
+        // Run the horizontal axis along whichever way the wall faces.
+        float along = (abs(n.x) > abs(n.z)) ? world.z : world.x;
+
+        // Ground floor is taller and glassier — shopfronts, not flats.
+        float groundH = storey * 1.45;
+        bool ground = h < groundH;
+
+        float fy, bay;
+        if (ground) {
+            fy = clamp(h / groundH, 0.0, 1.0);
+            bay = 3.2 + hash11(seed * 3.1) * 0.9;
+        } else {
+            fy = fract((h - groundH) / storey);
+            bay = 2.15 + hash11(seed * 7.3) * 0.75;
+        }
+        float bayIndex = floor(along / bay);
+        float fx = fract(along / bay);
+
+        float wx0 = ground ? 0.10 : 0.20;
+        float wx1 = ground ? 0.90 : 0.80;
+        float wy0 = ground ? 0.10 : 0.24;
+        float wy1 = ground ? 0.88 : 0.84;
+
+        float inX = step(wx0, fx) * step(fx, wx1);
+        float inY = step(wy0, fy) * step(fy, wy1);
+        float win = inX * inY;
+
+        // No windows in the plinth or immediately under the cornice.
+        float capTop = total - 0.9;
+        win *= step(0.55, h) * step(h, capTop);
+
+        // Distance inside the opening, used to fake depth: the reveal darkens
+        // towards the frame, which is what makes a window read as a hole rather
+        // than a painted rectangle.
+        float dx = min(fx - wx0, wx1 - fx) / max(0.001, (wx1 - wx0) * 0.5);
+        float dy = min(fy - wy0, wy1 - fy) / max(0.001, (wy1 - wy0) * 0.5);
+        float inset = clamp(min(dx, dy) * 3.2, 0.0, 1.0);
+
+        // Glass: dark interior plus a sky reflection that strengthens at grazing
+        // angles. This is what stops windows looking like grey paint.
+        float fres = pow(1.0 - saturate(dot(n, -viewDir)), 3.0);
+        float3 sky = mix(u.skyHorizon.xyz, u.skyTop.xyz, 0.35);
+        float3 interior = float3(0.055, 0.065, 0.080)
+                        + hash11(bayIndex * 3.7 + floor(h / storey) * 11.3) * 0.045;
+        float3 glass = mix(interior, sky, 0.18 + 0.62 * fres);
+
+        float bar = step(0.47, fract(fx * 2.0)) * step(fract(fx * 2.0), 0.53);
+        glass = mix(glass, albedo * 0.85, bar * 0.55 * win);
+
+        float3 colour = albedo;
+        colour = mix(colour, albedo * 0.55, win * (1.0 - inset));
+        colour = mix(colour, glass, win * inset);
+        gloss = win * inset;
+
+        float sill = inX * step(wy0 - 0.075, fy) * step(fy, wy0 - 0.005);
+        colour = mix(colour, albedo * 1.22, sill * 0.9);
+
+        float lintel = inX * step(wy1 + 0.005, fy) * step(fy, wy1 + 0.05);
+        colour = mix(colour, albedo * 0.72, lintel * 0.8);
+
+        float plinth = 1.0 - smoothstep(0.55, 0.95, h);
+        colour = mix(colour, float3(0.42, 0.41, 0.39), plinth * 0.85);
+
+        float cornice = smoothstep(capTop - 0.35, capTop, h)
+                      * (1.0 - smoothstep(total - 0.12, total, h));
+        colour = mix(colour, albedo * 1.16, cornice * 0.8);
+        float underCornice = smoothstep(capTop - 0.75, capTop - 0.35, h)
+                           * (1.0 - smoothstep(capTop - 0.35, capTop - 0.2, h));
+        colour *= (1.0 - 0.18 * underCornice);
+
+        float slab = smoothstep(0.0, 0.05, fy) * smoothstep(0.10, 0.05, fy);
+        colour *= (1.0 - 0.13 * slab * (1.0 - float(ground)));
+
+        // Vertical weathering, strongest low down.
+        float streak = hash11(floor(along * 1.7) + seed * 91.0);
+        colour *= 1.0 - 0.07 * streak * (1.0 - smoothstep(0.0, 12.0, h));
+
+        return colour;
+    }
+
+    static inline float3 aces(float3 x) {
+        const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+        return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
     }
 
     fragment float4 scene_fragment(VOut in [[stage_in]],
                                    constant Uniforms& u [[buffer(1)]],
                                    texture2d<float> ortho [[texture(0)]],
-                                   sampler orthoSampler [[sampler(0)]]) {
+                                   depth2d<float> shadowMap [[texture(1)]],
+                                   sampler orthoSampler [[sampler(0)]],
+                                   sampler shadowSampler [[sampler(1)]]) {
         float3 n = normalize(in.normal);
         float3 sun = normalize(u.sunDirection.xyz);
+        float3 viewDir = normalize(in.world - u.cameraPosition.xyz);
         float3 albedo = in.colour;
         float photographic = 0.0;
+        float gloss = 0.0;
 
-        // Terrain is the aerial photograph itself — and so are the roofs. The
-        // ortho is a top-down image, so the real roof of every building is
-        // already sitting in it at that XZ. Sampling it there costs nothing and
-        // replaces 12,538 invented flat-brown lids with the actual roofs, tiles,
-        // skylights, courtyards and all.
-        //
-        // It is an approximation: the photo is orthorectified to the ground, so
-        // a tall building leans away from nadir and its roof pixels sit slightly
-        // off. At Zurich's 15 m average that is a metre or two, well below what
-        // you can see from a car.
-        bool photoSurface = (in.material > 2.5)                       // terrain
-                         || (in.material > 1.5 && in.material < 2.5); // roofs
+        // Terrain and roofs are the aerial photograph itself. The ortho is
+        // top-down, so every building's real roof already sits in it at that XZ.
+        bool photoSurface = (in.material > 2.5)
+                         || (in.material > 1.5 && in.material < 2.5);
         if (photoSurface && u.flags.x > 0.5) {
             float2 uv = float2((in.world.x - u.orthoExtent.x)
                                  / (u.orthoExtent.z - u.orthoExtent.x),
@@ -298,82 +522,60 @@ final class Renderer {
                                  / (u.orthoExtent.w - u.orthoExtent.y));
             albedo = ortho.sample(orthoSampler, uv).rgb;
             photographic = 1.0;
+        } else if (in.material > 0.5 && in.material < 1.5) {
+            albedo = facade(albedo, in.world, n, in.params, viewDir, u, gloss);
+        } else {
+            // Carriageway. A single flat grey reads as poured concrete, so break
+            // it up: coarse patch variation for resurfacing, fine speckle for
+            // aggregate, and a damp sheen that catches the sun at low angles.
+            // Fine aggregate only. Coarse patch variation on an axis-aligned
+            // grid reads as a checkerboard, which is worse than flat grey.
+            float grain = hash11(floor(in.world.x * 4.7) * 7.0
+                               + floor(in.world.z * 4.7) * 13.0);
+            albedo *= 0.975 + grain * 0.05;
+            gloss = 0.16;
         }
 
-        // Procedural facades. Blank extrusions read as cardboard no matter how
-        // good the lighting is; a storey rhythm is what makes a box become a
-        // building. Storey height matches the 3.2 m used to estimate heights.
-        if (in.material > 0.5 && in.material < 1.5) {
-            // Run the horizontal axis along whichever way the wall faces.
-            float along = (abs(n.x) > abs(n.z)) ? in.world.z : in.world.x;
-            float storey = 3.2;
-            float bay = 2.6;
-
-            float fy = fract(in.world.y / storey);
-            float fx = fract(along / bay);
-
-            // Window pane occupies the middle of each bay and the upper part of
-            // each storey, leaving a sill and a spandrel band.
-            float win = step(0.16, fx) * step(fx, 0.78)
-                      * step(0.30, fy) * step(fy, 0.86);
-
-            // Ground floor is shopfront in central Zurich: taller and glassier.
-            float groundFloor = 1.0 - step(storey, in.world.y - 0.0);
-
-            float3 glass = float3(0.16, 0.19, 0.24);
-            // A little variety so every pane is not identically lit.
-            float jitter = fract(sin(floor(along / bay) * 12.9898
-                                   + floor(in.world.y / storey) * 78.233) * 43758.5453);
-            glass += jitter * 0.10;
-
-            albedo = mix(albedo, glass, win * (0.72 + 0.2 * groundFloor));
-
-            // Thin darker line at each floor slab.
-            float slab = smoothstep(0.0, 0.06, fy) * smoothstep(0.12, 0.06, fy);
-            albedo *= (1.0 - 0.22 * slab);
-        }
-
-        // Direct sun, plus a sky/ground hemisphere term. The hemisphere light is
-        // what keeps north-facing walls and street canyons from going pure black
-        // without needing any global illumination.
         float ndl = max(dot(n, sun), 0.0);
-        float3 direct = float3(1.05, 1.00, 0.92) * ndl;
+        float visibility = sunVisibility(in.world, ndl, u, shadowMap, shadowSampler);
+
+        float3 direct = float3(1.18, 1.09, 0.94) * ndl * visibility;
         float hemi = 0.5 + 0.5 * n.y;
-        float3 ambient = mix(float3(0.34, 0.35, 0.34), float3(0.50, 0.56, 0.64), hemi);
+        float3 ambient = mix(float3(0.26, 0.27, 0.28), float3(0.40, 0.45, 0.53), hemi);
+        // Shadowed surfaces still see sky, just not sun.
+        ambient *= mix(0.82, 1.0, visibility);
 
         float3 lit = albedo * (direct + ambient);
 
-        // An aerial photograph already carries the sun that took it. Lighting it
-        // again doubles the contrast and turns every roof into a highlight, so
-        // fade towards flat albedo for photographic surfaces.
-        lit = mix(lit, albedo * 1.06, photographic * 0.82);
-
-        // Cheap specular sheen on near-horizontal surfaces reads as damp tarmac.
-        float3 view = normalize(u.cameraPosition.xyz - in.world);
-        float3 halfway = normalize(view + sun);
-        float spec = pow(max(dot(n, halfway), 0.0), 48.0) * 0.06 * step(0.9, n.y);
+        float3 halfway = normalize(-viewDir + sun);
+        float specPower = mix(52.0, 180.0, gloss);
+        float spec = pow(max(dot(n, halfway), 0.0), specPower)
+                   * mix(0.05 * step(0.9, n.y), 0.55, gloss) * visibility;
         lit += spec;
+
+        // An aerial photograph already carries the sun that took it. Relighting
+        // doubles the contrast, so fade towards flat albedo — but keep some
+        // shadow, or buildings float with nothing beneath them.
+        float3 flatLit = albedo * mix(0.72, 1.05, visibility);
+        lit = mix(lit, flatLit, photographic * 0.80);
 
         float dist = length(u.cameraPosition.xyz - in.world);
         float fog = 1.0 - exp(-dist * u.fog.w);
         lit = mix(lit, u.fog.xyz, clamp(fog, 0.0, 1.0));
 
-        return float4(lit, 1.0);
+        return float4(aces(lit * 1.05), 1.0);
     }
 
     vertex float4 sky_vertex(uint vid [[vertex_id]]) {
-        // One oversized triangle covering the viewport.
         float2 p = float2((vid == 2) ? 3.0 : -1.0, (vid == 1) ? 3.0 : -1.0);
         return float4(p, 1.0, 1.0);
     }
 
     fragment float4 sky_fragment(float4 pos [[position]],
                                  constant Uniforms& u [[buffer(1)]]) {
-        // Gradient by screen height. Good enough: the horizon band is what sells
-        // the haze, and anything above it is barely in frame from a car.
-        float t = clamp(pos.y / u.skyTop.w, 0.0, 1.0);
-        float3 c = mix(u.skyTop.xyz, u.skyHorizon.xyz, pow(t, 0.65));
-        return float4(c, 1.0);
+        float t = clamp(pos.y / max(1.0, u.flags.y), 0.0, 1.0);
+        float3 c = mix(u.skyTop.xyz, u.skyHorizon.xyz, pow(t, 0.6));
+        return float4(aces(c * 1.05), 1.0);
     }
     """
 }
@@ -396,10 +598,23 @@ func perspective(fov: Float, aspect: Float, near: Float, far: Float) -> simd_flo
         SIMD4(0, 0, z * near, 0)))
 }
 
+func orthographic(left: Float, right: Float, bottom: Float, top: Float,
+                  near: Float, far: Float) -> simd_float4x4 {
+    simd_float4x4(columns: (
+        SIMD4(2 / (right - left), 0, 0, 0),
+        SIMD4(0, 2 / (top - bottom), 0, 0),
+        SIMD4(0, 0, -1 / (far - near), 0),
+        SIMD4(-(right + left) / (right - left),
+              -(top + bottom) / (top - bottom),
+              -near / (far - near), 1)))
+}
+
 func lookAt(eye: SIMD3<Float>, target: SIMD3<Float>, up: SIMD3<Float> = SIMD3(0, 1, 0))
     -> simd_float4x4 {
     let f = normalize(target - eye)
-    let s = normalize(cross(f, up))
+    var upv = up
+    if abs(dot(f, normalize(up))) > 0.999 { upv = SIMD3(1, 0, 0) }
+    let s = normalize(cross(f, upv))
     let u = cross(s, f)
     return simd_float4x4(columns: (
         SIMD4(s.x, u.x, -f.x, 0),

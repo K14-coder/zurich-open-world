@@ -1,14 +1,29 @@
 import Foundation
 import simd
 
-let here = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-let worldURL = here.appendingPathComponent("../zurich_world.json")
-let buildingsURL = here.appendingPathComponent("../zurich_buildings.json")
+/// Find the world data whether we are run from the scratchpad or from the repo,
+/// where the Swift package sits two levels below `data/`.
+func locate(_ name: String) -> URL {
+    let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let candidates = ["..", "../..", "../../data", "../data", "data", "."]
+    for c in candidates {
+        let url = cwd.appendingPathComponent(c).appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: url.path) { return url.standardized }
+    }
+    FileHandle.standardError.write(Data("could not find \(name)\n".utf8))
+    exit(1)
+}
+
+let worldURL = locate("zurich_world.json")
+let buildingsURL = locate("zurich_buildings.json")
+let orthoImageURL = locate("zurich_ortho.jpg")
+let orthoMetaURL = locate("zurich_ortho.json")
+let here = worldURL.deletingLastPathComponent()
 
 // The one mismatch that silently corrupts everything: keep Swift and Metal
 // agreeing on the vertex stride.
-precondition(MemoryLayout<Vertex>.stride == 48,
-             "Vertex stride is \(MemoryLayout<Vertex>.stride), shader expects 48")
+precondition(MemoryLayout<Vertex>.stride == 64,
+             "Vertex stride is \(MemoryLayout<Vertex>.stride), shader expects 64")
 
 var clock = Date()
 let mesh = try WorldMesh(worldURL: worldURL, buildingsURL: buildingsURL)
@@ -20,8 +35,7 @@ print("  terrain \(mesh.terrainRange.count / 3), roads \(mesh.roadRange.count / 
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
 clock = Date()
-renderer.loadOrtho(imageURL: here.appendingPathComponent("../zurich_ortho.jpg"),
-                   metaURL: here.appendingPathComponent("../zurich_ortho.json"))
+renderer.loadOrtho(imageURL: orthoImageURL, metaURL: orthoMetaURL)
 print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
 
 /// Eye point for a driver: on the road, at seat height, looking down the street.
@@ -71,7 +85,7 @@ let width = 1400, height = 850
 for shot in shots {
     clock = Date()
     let image = try renderer.render(camera: shot.camera, width: width, height: height)
-    let out = here.appendingPathComponent("../shot-\(shot.name).png")
+    let out = here.appendingPathComponent("shot-\(shot.name).png")
     try Renderer.write(image, to: out)
     print(String(format: "  %-28@ %.0f ms  %@", shot.name,
                  -clock.timeIntervalSinceNow * 1000, shot.note))

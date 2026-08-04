@@ -6,14 +6,18 @@ import simd
 /// Everything is baked into one vertex buffer at load: the city is small enough
 /// (a few hundred thousand triangles) that streaming and LOD would be effort
 /// spent solving a problem this world does not have.
-/// - Note: `colour` is deliberately a SIMD4 with the material id in `w`. That
-///   keeps the stride at 48 bytes — three 16-byte-aligned slots — which is what
-///   the shader's `float3, float3, float4` expects. Adding a bare `Float`
-///   instead would silently push the stride to 64 and corrupt every vertex.
+/// - Note: every field is a 16-byte-aligned slot, giving a 64-byte stride that
+///   the shader's `float3, float3, float4, float4` matches exactly. Adding a
+///   bare `Float` anywhere would silently change the stride and corrupt every
+///   vertex — there is a `precondition` on this in main.swift.
 struct Vertex {
     var position: SIMD3<Float>
     var normal: SIMD3<Float>
     var colour: SIMD4<Float>
+    /// Per-building: base elevation, storey height, random seed, total height.
+    /// Zero for terrain and roads. Without the base, storey lines are keyed to
+    /// absolute world height and float free of the building they belong to.
+    var params: SIMD4<Float>
 
     enum Material: Float {
         case plain = 0      // terrain, roads
@@ -23,10 +27,12 @@ struct Vertex {
     }
 
     init(position: SIMD3<Float>, normal: SIMD3<Float>,
-         colour: SIMD3<Float>, material: Material = .plain) {
+         colour: SIMD3<Float>, material: Material = .plain,
+         params: SIMD4<Float> = .zero) {
         self.position = position
         self.normal = normal
         self.colour = SIMD4(colour, material.rawValue)
+        self.params = params
     }
 }
 
@@ -251,10 +257,12 @@ final class WorldMesh {
 
     private func roadColour(_ cls: String) -> SIMD3<Float> {
         switch cls.replacingOccurrences(of: "_link", with: "") {
-        case "motorway", "trunk":       return SIMD3(0.24, 0.24, 0.26)
-        case "primary", "secondary":    return SIMD3(0.22, 0.22, 0.24)
-        case "service":                 return SIMD3(0.26, 0.25, 0.24)
-        default:                        return SIMD3(0.20, 0.20, 0.22)
+        // Real asphalt is dark, but a dark albedo under canyon shade crushes to
+        // black once tone mapping is applied. These are lifted deliberately.
+        case "motorway", "trunk":       return SIMD3(0.170, 0.170, 0.184)
+        case "primary", "secondary":    return SIMD3(0.162, 0.162, 0.176)
+        case "service":                 return SIMD3(0.185, 0.181, 0.176)
+        default:                        return SIMD3(0.155, 0.155, 0.168)
         }
     }
 
@@ -268,13 +276,28 @@ final class WorldMesh {
             let base = b.b
             let top = b.b + b.h
 
-            // Zurich's centre is render-grey, sandstone and pale ochre. Vary per
-            // building or the city turns into one continuous grey extrusion.
+            // Zurich's centre is render, sandstone, pale ochre and painted
+            // stucco. Vary per building or the city turns into one continuous
+            // grey extrusion.
             let hash = Float((n &* 2654435761) % 997) / 997.0
-            let wall = mix(SIMD3<Float>(0.62, 0.60, 0.56),
-                           SIMD3<Float>(0.78, 0.74, 0.66), t: hash)
+            let hash2 = Float((n &* 40503) % 811) / 811.0
+            let palette: [SIMD3<Float>] = [
+                SIMD3(0.78, 0.75, 0.68),   // warm render
+                SIMD3(0.70, 0.70, 0.67),   // grey render
+                SIMD3(0.82, 0.78, 0.70),   // pale ochre
+                SIMD3(0.74, 0.72, 0.68),   // stone
+                SIMD3(0.66, 0.67, 0.64),   // grey-green
+                SIMD3(0.85, 0.83, 0.79),   // near-white stucco
+            ]
+            let wall = palette[Int(hash * Float(palette.count)) % palette.count]
+                       * (0.92 + hash2 * 0.14)
             let roof = mix(SIMD3<Float>(0.30, 0.26, 0.25),
                            SIMD3<Float>(0.42, 0.31, 0.27), t: hash)
+
+            // Real storey heights are not uniform. 2.9-3.6 m spans the range
+            // from a tight residential floor to a generous commercial one.
+            let storey = 2.9 + hash2 * 0.7
+            let params = SIMD4<Float>(Float(base), storey, hash, Float(b.h))
 
             // Walls
             for k in 0..<ring.count {
@@ -292,7 +315,8 @@ final class WorldMesh {
                     let occlusion: Float = (y == base) ? 0.62 : 1.0
                     vertices.append(Vertex(
                         position: SIMD3(Float(p.x), Float(y), Float(p.y)),
-                        normal: nrm, colour: wall * occlusion, material: .wall))
+                        normal: nrm, colour: wall * occlusion, material: .wall,
+                        params: params))
                 }
                 indices += [idx, idx + 2, idx + 1, idx + 1, idx + 2, idx + 3]
             }

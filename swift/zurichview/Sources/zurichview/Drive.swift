@@ -36,6 +36,7 @@ final class DriveView: MTKView, MTKViewDelegate {
         super.init(frame: frame, device: renderer.metalDevice)
         colorPixelFormat = .bgra8Unorm
         depthStencilPixelFormat = .depth32Float
+        sampleCount = Renderer.sampleCount   // must match the pipelines
         clearColor = MTLClearColor(red: 0.76, green: 0.82, blue: 0.88, alpha: 1)
         preferredFramesPerSecond = 60
         delegate = self
