@@ -30,6 +30,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 
+import plane_fit
+
 from zurich_circuit import wgs84_to_lv95
 from zurich_world import terrain_at
 from clean_plate import median_composite
@@ -43,6 +45,12 @@ IMG_CACHE.mkdir(parents=True, exist_ok=True)
 PIXELS_PER_METRE = 20          # 5 cm/px
 MAX_RANGE = 30.0
 MAX_OFF_AXIS = math.radians(65)
+# Stricter gates for *texturing* than for counting coverage. A wall seen from
+# 28 m at 60° incidence is foreshortened into a few dozen pixels of mush; it
+# counts as a pass but it can never agree with a head-on view, and including it
+# is what keeps the composite blurred.
+TEX_MAX_RANGE = 20.0
+TEX_MAX_INCIDENCE = math.radians(45)
 # Camera height above the road. Mapillary's computed_altitude is WGS84
 # ellipsoidal, which sits ~50 m off orthometric height in Switzerland; getting
 # that wrong shears the whole façade vertically, so a fixed height above our own
@@ -258,11 +266,8 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
     ax, az = f["a"]
     bx, bz = f["z"]
     nx, nz = f["n"]
-    length = math.hypot(bx - ax, bz - az)
-    base, height = f["base"], f["h"]
-
-    # Candidate views: near enough, on the right side, pointing at the wall.
     mx, mz = (ax + bx) / 2, (az + bz) / 2
+
     cands = []
     for img in images:
         x, z, dx, dz, seq = img["_p"]
@@ -273,6 +278,12 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
         if (x - mx) * nx + (z - mz) * nz <= 0:
             continue
         if (vx * dx + vz * dz) / dist < math.cos(MAX_OFF_AXIS):
+            continue
+        if dist > TEX_MAX_RANGE:
+            continue
+        # Incidence: how square-on the camera sits to the wall, which decides
+        # how much real resolution this view can contribute.
+        if ((x - mx) * nx + (z - mz) * nz) / dist < math.cos(TEX_MAX_INCIDENCE):
             continue
         if occluders is not None and blocked(x, z, mx, mz, f["b"], occluders):
             continue
@@ -286,22 +297,14 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
     for dist, img in sorted(cands, key=lambda c: c[0]):
         by_seq.setdefault(img["_p"][4], (dist, img))
     chosen = [img for _, img in list(by_seq.values())[:max_views]]
-    if len(chosen) < 2:
+    if len(chosen) < 3:
         return None, len(chosen)
 
     details = fetch_details([c["id"] for c in chosen], tok)
 
-    # Sample grid across the wall, in world space.
-    W = max(24, int(length * PIXELS_PER_METRE))
-    H = max(24, int(height * PIXELS_PER_METRE))
-    u = (np.arange(W) + 0.5) / W
-    v = (np.arange(H) + 0.5) / H
-    U, V = np.meshgrid(u, v)
-    Px = ax + (bx - ax) * U
-    Pz = az + (bz - az) * U
-    Py = base + height * (1.0 - V)          # v=0 is the top of the wall
-
-    views, masks = [], []
+    # Load each view once. Everything after this is pure arithmetic, which is
+    # what makes searching over hundreds of candidate planes affordable.
+    prepared = []
     for img in chosen:
         meta = details.get(img["id"])
         if not meta or not meta.get("computed_rotation"):
@@ -309,37 +312,51 @@ def rectify_facade(f: dict, images: list, grid: dict, e0: float, n0: float,
         pixels = fetch_pixels(meta)
         if pixels is None:
             continue
-
         lon, lat = meta["computed_geometry"]["coordinates"]
         east, north = wgs84_to_lv95(lat, lon)
         cx, cz = east - e0, -(north - n0)
-        cy = terrain_at(grid, cx, cz) + CAMERA_HEIGHT
+        prepared.append({
+            "meta": meta, "pixels": pixels,
+            "R": rodrigues(meta["computed_rotation"]),
+            "cx": cx, "cz": cz,
+            "cy": terrain_at(grid, cx, cz) + CAMERA_HEIGHT,
+        })
+    if len(prepared) < 3:
+        return None, len(prepared)
 
-        # Our world is X east, Y up, Z south. Mapillary's rotation is expressed
-        # against local ENU, so swap into (east, north, up) before rotating.
-        dX, dY, dZ = Px - cx, Py - cy, Pz - cz
-        enu = np.stack([dX, -dZ, dY], axis=-1)
-        R = rodrigues(meta["computed_rotation"])
-        cam = enu @ R.T
+    def sample(Px, Py, Pz):
+        views, masks = [], []
+        for p in prepared:
+            enu = np.stack([Px - p["cx"], -(Pz - p["cz"]), Py - p["cy"]], axis=-1)
+            cam = enu @ p["R"].T
+            pxpy, valid = project(cam, p["meta"])
+            s = sample_bilinear(p["pixels"], pxpy[..., 0], pxpy[..., 1])
+            s = np.where(valid[..., None], s, 0.0)
+            if valid.mean() < 0.5:
+                continue
+            shot = np.clip(s, 0, 255).astype(np.uint8)
+            if looks_like_sky(shot, valid) > 0.35:
+                continue
+            views.append(shot)
+            masks.append(valid)
+        return views, masks
 
-        px_py, valid = project(cam, meta)
-        sampled = sample_bilinear(pixels, px_py[..., 0], px_py[..., 1])
-        sampled = np.where(valid[..., None], sampled, 0.0)
-        if valid.mean() < 0.5:
-            continue
-        shot = np.clip(sampled, 0, 255).astype(np.uint8)
-        if looks_like_sky(shot, valid) > 0.35:
-            continue
-        views.append(shot)
-        masks.append(valid)
+    params, score = plane_fit.fit(f, sample, verbose=True)
+    if params is None:
+        return None, len(prepared)
 
+    offset, yaw, base_dy = params
+    height = min(f["h"], plane_fit.FIT_HEIGHT)
+    Px, Py, Pz = plane_fit.plane_grid(f, offset, yaw, base_dy,
+                                      PIXELS_PER_METRE, height)
+    views, masks = sample(Px, Py, Pz)
     if len(views) < 2:
         return None, len(views)
 
     raw_first = views[0]
     views, masks, aligned = align_views(views, masks)
     plate = median_composite(views, masks)
-    return (plate, raw_first, aligned), len(views)
+    return (plate, raw_first, aligned, params, score), len(views)
 
 
 def phase_shift(ref: np.ndarray, img: np.ndarray, max_shift: float = 0.18):
@@ -380,59 +397,52 @@ def phase_shift(ref: np.ndarray, img: np.ndarray, max_shift: float = 0.18):
 def align_views(views: list, masks: list):
     """Register every view onto the one with the most valid coverage.
 
-    A translation is not enough. Each view sees the wall from a different
-    distance and angle, and the façade plane taken from an OSM footprint is only
-    approximately where the real wall is, so the residual between two rectified
-    views is a homography — the reason a plain median came out as a smear.
-    ORB features plus RANSAC recover it.
+    Intensity-based (ECC), not feature-based. Fitting the plane removes the
+    *systematic* error — the footprint being in the wrong place — but each
+    photograph still carries its own GPS and orientation error, so a residual
+    of a few pixels per view remains.
+
+    Feature matching cannot resolve it: a façade is a grid of near-identical
+    window bays, so a descriptor matches one bay to the next just as happily as
+    to itself, and RANSAC then agrees on a confidently wrong homography. ECC
+    optimises photometric agreement over the whole overlap instead, which has no
+    such ambiguity, and it is initialised at identity because the plane fit has
+    already brought the views close.
     """
     import cv2
 
     ref_i = int(np.argmax([m.mean() for m in masks]))
-    ref = views[ref_i]
-    ref_gray = cv2.cvtColor(ref, cv2.COLOR_RGB2GRAY)
-    h, w = ref_gray.shape
-
-    orb = cv2.ORB_create(nfeatures=1500)
-    kp_ref, des_ref = orb.detectAndCompute(ref_gray, None)
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    ref = cv2.cvtColor(views[ref_i], cv2.COLOR_RGB2GRAY).astype(np.float32)
+    h, w = ref.shape
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
 
     out_v, out_m, aligned = [], [], 0
     for i, (v, m) in enumerate(zip(views, masks)):
-        if i == ref_i or des_ref is None or len(kp_ref) < 12:
+        if i == ref_i:
+            out_v.append(v); out_m.append(m)
+            continue
+        gray = cv2.cvtColor(v, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        warp = np.eye(2, 3, dtype=np.float32)
+        try:
+            _, warp = cv2.findTransformECC(
+                ref, gray, warp, cv2.MOTION_EUCLIDEAN, criteria,
+                (m & masks[ref_i]).astype(np.uint8), 5)
+        except cv2.error:
             out_v.append(v); out_m.append(m)
             continue
 
-        gray = cv2.cvtColor(v, cv2.COLOR_RGB2GRAY)
-        kp, des = orb.detectAndCompute(gray, None)
-        if des is None or len(kp) < 12:
+        # Reject an implausible correction: the plane fit already did the heavy
+        # lifting, so anything beyond a few per cent of the plate is a failure
+        # to converge rather than a real offset.
+        if abs(warp[0, 2]) > 0.12 * w or abs(warp[1, 2]) > 0.12 * h:
             out_v.append(v); out_m.append(m)
             continue
 
-        matches = sorted(matcher.match(des, des_ref), key=lambda x: x.distance)[:220]
-        if len(matches) < 12:
-            out_v.append(v); out_m.append(m)
-            continue
-
-        src = np.float32([kp[x.queryIdx].pt for x in matches]).reshape(-1, 1, 2)
-        dst = np.float32([kp_ref[x.trainIdx].pt for x in matches]).reshape(-1, 1, 2)
-        H, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
-        if H is None or inliers is None or int(inliers.sum()) < 10:
-            out_v.append(v); out_m.append(m)
-            continue
-
-        # Reject anything that is not a mild correction: a wild homography means
-        # the match latched onto a repeating window pattern, which façades are
-        # full of, and warping by it would be worse than leaving the view alone.
-        corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-        moved = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
-        if np.abs(moved - corners.reshape(-1, 2)).max() > 0.25 * max(w, h):
-            out_v.append(v); out_m.append(m)
-            continue
-
-        out_v.append(cv2.warpPerspective(v, H, (w, h), flags=cv2.INTER_LINEAR))
-        out_m.append(cv2.warpPerspective(m.astype(np.uint8), H, (w, h),
-                                         flags=cv2.INTER_NEAREST).astype(bool))
+        out_v.append(cv2.warpAffine(v, warp, (w, h),
+                                    flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP))
+        out_m.append(cv2.warpAffine(m.astype(np.uint8), warp, (w, h),
+                                    flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP
+                                    ).astype(bool))
         aligned += 1
 
     return out_v, out_m, aligned
@@ -480,7 +490,7 @@ def main() -> None:
         if result is None:
             print(f"    façade {i}: only {n} usable views, skipped")
             continue
-        plate, raw_first, aligned = result
+        plate, raw_first, aligned, params, score = result
         Image.fromarray(plate).save(out_dir / f"facade_{i:02d}_plate.jpg", quality=92)
         # Side by side with a single raw view, so the effect is visible.
         strip = Image.new("RGB", (plate.shape[1] * 2, plate.shape[0]))
@@ -488,7 +498,7 @@ def main() -> None:
         strip.paste(Image.fromarray(plate), (plate.shape[1], 0))
         strip.save(out_dir / f"facade_{i:02d}_compare.jpg", quality=92)
         made.append((i, f, n))
-        print(f"    façade {i}: {n} views ({aligned} homography-aligned) -> "
+        print(f"    façade {i}: {n} views ({aligned} refined) -> "
               f"{plate.shape[1]}x{plate.shape[0]} plate  ({f['len']:.1f} m wide)")
 
     if made:
