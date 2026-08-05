@@ -15,6 +15,13 @@ struct Uniforms {
     var skyHorizon: SIMD4<Float>
     var orthoExtent: SIMD4<Float>   // minX, minZ, maxX, maxZ
     var flags: SIMD4<Float>         // x = ortho bound, y = viewport height
+    // Projective texturing: the two panoramas nearest the camera, their poses,
+    // and the crossfade between them.
+    var panoA: SIMD4<Float>         // xyz position, w layer index
+    var panoB: SIMD4<Float>
+    var panoARot: simd_float3x3
+    var panoBRot: simd_float3x3
+    var panoParams: SIMD4<Float>    // x blend, y enabled, z max range, w unused
 }
 
 struct Camera {
@@ -43,6 +50,7 @@ final class Renderer {
     private var ortho: Ortho?
     private var materials: Materials?
     private var facadeAtlas: MTLTexture?
+    private var panoramas: Panoramas?
     private var sampler: MTLSamplerState!
     private var shadowSampler: MTLSamplerState!
     private let shadowMap: MTLTexture
@@ -159,6 +167,12 @@ final class Renderer {
     }
 
     @discardableResult
+    func loadPanoramas(indexURL: URL) -> Int {
+        panoramas = Panoramas(indexURL: indexURL, device: device, queue: queue)
+        return panoramas?.poses.count ?? 0
+    }
+
+    @discardableResult
     func loadFacadeAtlas(url: URL) -> Bool {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
@@ -225,7 +239,23 @@ final class Renderer {
             orthoExtent: ortho?.extent ?? .zero,
             flags: SIMD4(ortho == nil ? 0 : 1, Float(height),
                          materials == nil ? 0 : 1,
-                         Float(materials?.wallLayers ?? 1)))
+                         Float(materials?.wallLayers ?? 1)),
+            panoA: .zero, panoB: .zero,
+            panoARot: matrix_identity_float3x3, panoBRot: matrix_identity_float3x3,
+            panoParams: .zero)
+
+        if let p = panoramas, p.poses.count > 1 {
+            let pick = p.nearest(to: camera.eye)
+            let a = p.poses[pick.a], b = p.poses[pick.b]
+            uniforms.panoA = SIMD4(a.position, Float(pick.a))
+            uniforms.panoB = SIMD4(b.position, Float(pick.b))
+            uniforms.panoARot = a.rotation
+            uniforms.panoBRot = b.rotation
+            // Fade the projection out with distance from the capture point:
+            // beyond that, parallax error grows and the procedural material is
+            // the better answer.
+            uniforms.panoParams = SIMD4(pick.blend, 1, 60, 0)
+        }
 
         // --- Shadow pass ---
         let shadowPass = MTLRenderPassDescriptor()
@@ -269,6 +299,7 @@ final class Renderer {
         enc.setFragmentTexture(materials?.normal, index: 3)
         enc.setFragmentTexture(materials?.roughness, index: 4)
         enc.setFragmentTexture(facadeAtlas, index: 5)
+        enc.setFragmentTexture(panoramas?.texture, index: 6)
         enc.setFragmentSamplerState(sampler, index: 0)
         enc.setFragmentSamplerState(shadowSampler, index: 1)
         enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
@@ -375,6 +406,11 @@ final class Renderer {
         float4 orthoExtent;
         float4 flags;       // x = ortho bound, y = viewport height,
                             // z = materials bound, w = wall layer count
+        float4 panoA;       // xyz position, w layer
+        float4 panoB;
+        float3x3 panoARot;
+        float3x3 panoBRot;
+        float4 panoParams;  // x blend, y enabled, z max range
     };
 
     // float3, NOT packed_float3: SIMD3<Float> is 16-byte aligned in Swift, so
@@ -537,6 +573,34 @@ final class Renderer {
         return colour;
     }
 
+    /// Sample one panorama by casting a ray from its camera to a world point.
+    static float3 sample_pano(float3 world, float3 camPos, float3x3 rot,
+                              uint layer, texture2d_array<float> panos,
+                              sampler smp, thread float& usable) {
+        float3 d = world - camPos;
+        // Our frame is X east, Y up, Z south; Mapillary poses are against local
+        // ENU, so swap before rotating into the camera.
+        float3 enu = float3(d.x, -d.z, d.y);
+        float3 cam = rot * enu;
+        float lon = atan2(cam.x, cam.z);
+        float lat = atan2(-cam.y, length(cam.xz));
+        float2 uv = float2(0.5 + lon / (2.0 * M_PI_F), 0.5 - lat / M_PI_F);
+
+        // The nadir of every panorama is the capture vehicle itself — bonnet,
+        // mirrors, roof rack. Projected onto the road it paints a ghost car
+        // permanently in front of you. Steeply downward rays close to the
+        // camera are that vehicle, so drop them and let the ground show through.
+        // 0.50 rad is ~29 deg below horizontal, which for a 2.2 m camera is
+        // everything inside about 4 m of it. That whole disc is the capture
+        // vehicle — bonnet, wipers, and the wing mirrors, which sit close to the
+        // horizon and so cannot be removed by a steeper cut. The procedural road
+        // takes over there, which costs little: the tarmac directly under the
+        // bumper is the least interesting thing in frame.
+        float below = -lat;                       // radians below horizontal
+        usable = 1.0 - smoothstep(0.35, 0.50, below);
+        return panos.sample(smp, uv, layer).rgb;
+    }
+
     static inline float3 aces(float3 x) {
         const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
         return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
@@ -550,6 +614,7 @@ final class Renderer {
                                    texture2d_array<float> matNormal [[texture(3)]],
                                    texture2d_array<float> matRough [[texture(4)]],
                                    texture2d<float> facadeAtlas [[texture(5)]],
+                                   texture2d_array<float> panos [[texture(6)]],
                                    sampler orthoSampler [[sampler(0)]],
                                    sampler shadowSampler [[sampler(1)]]) {
         float3 n = normalize(in.normal);
@@ -677,6 +742,27 @@ final class Renderer {
         // shadow, or buildings float with nothing beneath them.
         float3 flatLit = albedo * mix(0.72, 1.05, visibility);
         lit = mix(lit, flatLit, photographic * 0.80);
+
+        // Projective texturing. Where a panorama covers this point, it replaces
+        // everything procedural: it is a photograph of the actual place, at full
+        // resolution, and no reconstruction stands between it and the screen.
+        if (u.panoParams.y > 0.5) {
+            float da = length(in.world - u.panoA.xyz);
+            float db = length(in.world - u.panoB.xyz);
+            float near = min(da, db);
+            float reach = smoothstep(u.panoParams.z, u.panoParams.z * 0.55, near);
+            if (reach > 0.001) {
+                float ua = 1.0, ub = 1.0;
+                float3 pa = sample_pano(in.world, u.panoA.xyz, u.panoARot,
+                                        uint(u.panoA.w), panos, orthoSampler, ua);
+                float3 pb = sample_pano(in.world, u.panoB.xyz, u.panoBRot,
+                                        uint(u.panoB.w), panos, orthoSampler, ub);
+                float3 photo = mix(pa, pb, u.panoParams.x);
+                reach *= mix(ua, ub, u.panoParams.x);
+                // The photograph carries its own light, as the orthophoto does.
+                lit = mix(lit, photo * mix(0.72, 1.0, visibility), reach);
+            }
+        }
 
         float dist = length(u.cameraPosition.xyz - in.world);
         float fog = 1.0 - exp(-dist * u.fog.w);

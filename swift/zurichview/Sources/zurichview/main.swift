@@ -48,6 +48,8 @@ renderer.loadOrtho(imageURL: orthoImageURL, metaURL: orthoMetaURL)
 print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
 clock = Date()
 let materialsDir = worldURL.deletingLastPathComponent().appendingPathComponent("materials")
+let panoCount = renderer.loadPanoramas(indexURL: locate("panoramas.json"))
+print("Panoramas loaded: \(panoCount)")
 if renderer.loadFacadeAtlas(url: locate("facade_atlas.jpg")) {
     print("Façade atlas loaded")
 } else {
@@ -103,10 +105,11 @@ shots.append(Shot(
     note: "low over Freiestrasse"))
 
 shots.append(Shot(
-    name: "plates",
-    camera: Camera(eye: SIMD3(1536.6, 37.8, 546.3),
-                   target: SIMD3(1542.9, 42.0, 555.3), fovDegrees: 62),
-    note: "photographic façades"))
+    name: "pano",
+    camera: Camera(eye: SIMD3(1633.2, 38.4, 609.6),
+                   target: SIMD3(1593.7, 36.9, 615.9),
+                   fovDegrees: 70),
+    note: "projective panorama"))
 
 let width = 1400, height = 850
 for shot in shots {

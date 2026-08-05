@@ -50,9 +50,16 @@ final class DriveView: MTKView, MTKViewDelegate {
     override func keyUp(with event: NSEvent) { held.remove(event.keyCode) }
 
     private func respawn(on street: String) {
-        // Prefer standing in front of the photographic façades: they are the
-        // point of the exercise and they occupy a few hundred metres of one
-        // street, so spawning at the street's midpoint usually misses them.
+        // Start on the panoramic run. That stretch is projectively textured from
+        // real photographs, and it is the only part of the city that looks the
+        // way this project is aiming for — spawning anywhere else shows the
+        // procedural build and buries the point.
+        if let pano = Self.panoramaStart() {
+            position = SIMD3(pano.x, 0, pano.z)
+            heading = pano.yaw
+            speed = 0
+            return
+        }
         if let spot = Self.plateViewpoint() {
             position = SIMD3(spot.x, 0, spot.z)
             heading = spot.yaw
@@ -61,6 +68,21 @@ final class DriveView: MTKView, MTKViewDelegate {
             heading = spawn.yaw
         }
         speed = 0
+    }
+
+    /// Start of the panoramic run, facing along it.
+    static func panoramaStart() -> (x: Double, z: Double, yaw: Double)? {
+        guard let url = try? dataURL("panoramas.json"),
+              let data = try? Data(contentsOf: url),
+              let file = try? JSONDecoder().decode(Panoramas.JSONFile.self, from: data)
+        else { return nil }
+        let ordered = file.panoramas.sorted { $0.index < $1.index }
+        guard let first = ordered.first, ordered.count > 1,
+              first.pos.count == 3 else { return nil }
+        let next = ordered[1]
+        let dx = next.pos[0] - first.pos[0]
+        let dz = next.pos[2] - first.pos[2]
+        return (first.pos[0], first.pos[2], atan2(dx, -dz))
     }
 
     /// A point on the road in front of a plated façade, facing it.
@@ -93,13 +115,15 @@ final class DriveView: MTKView, MTKViewDelegate {
         return (px, pz, atan2(dx, -dz))
     }
 
-    private static func plateURL() throws -> URL {
+    private static func plateURL() throws -> URL { try dataURL("facade_atlas.json") }
+
+    private static func dataURL(_ name: String) throws -> URL {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for c in ["..", "../..", "../../data", "../data", "data", "."] {
-            let u = cwd.appendingPathComponent(c).appendingPathComponent("facade_atlas.json")
+            let u = cwd.appendingPathComponent(c).appendingPathComponent(name)
             if FileManager.default.fileExists(atPath: u.path) { return u.standardized }
         }
-        throw Fail("no atlas")
+        throw Fail("missing \(name)")
     }
 
     private var forward: SIMD3<Double> {
