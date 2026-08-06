@@ -50,6 +50,12 @@ print("  total \(mesh.indices.count / 3) triangles")
 // their own camera pose are a different thing: one photograph, at full
 // resolution, with no reconstruction between it and the screen.
 
+clock = Date()
+let panoMeshes = mesh.buildPanoMeshes(indexURL: locate("panoramas.json"))
+print(String(format: "Panorama meshes: %d built in %.2f s (%d triangles)",
+             panoMeshes, -clock.timeIntervalSinceNow,
+             mesh.panoMeshRanges.reduce(0) { $0 + $1.count } / 3))
+
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
 clock = Date()

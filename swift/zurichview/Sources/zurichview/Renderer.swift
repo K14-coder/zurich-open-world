@@ -47,6 +47,8 @@ final class Renderer {
     private let indexBuffer: MTLBuffer
     private let indexCount: Int
     private let shadowCasterRange: Range<Int>
+    private let staticIndexCount: Int
+    private let panoMeshRanges: [Range<Int>]
     private var ortho: Ortho?
     private var materials: Materials?
     private var facadeAtlas: MTLTexture?
@@ -144,6 +146,10 @@ final class Renderer {
         // pure self-shadowing acne — it turned every road pitch black — and a
         // level city gains nothing from terrain casting onto terrain.
         shadowCasterRange = mesh.buildingRange
+        panoMeshRanges = mesh.panoMeshRanges
+        // Panorama meshes live at the end of the buffer and are drawn one at a
+        // time; 44 overlapping copies of the same street would fight otherwise.
+        staticIndexCount = mesh.panoMeshRanges.compactMap(\.first).min() ?? mesh.indices.count
 
         let sd2 = MTLSamplerDescriptor()
         sd2.minFilter = .linear
@@ -302,9 +308,31 @@ final class Renderer {
         enc.setFragmentTexture(panoramas?.texture, index: 6)
         enc.setFragmentSamplerState(sampler, index: 0)
         enc.setFragmentSamplerState(shadowSampler, index: 1)
-        enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
-                                  indexType: .uint32, indexBuffer: indexBuffer,
-                                  indexBufferOffset: 0)
+        // Inside a panorama's coverage the photograph *is* the scene, so the
+        // modelled city is not drawn at all. Drawing both puts extruded boxes
+        // through the middle of the photograph — they occupy the same space and
+        // disagree about what is there, which is most of what "separate pictures
+        // and distorted" was.
+        var photographed: Range<Int>? = nil
+        if let p = panoramas, !panoMeshRanges.isEmpty {
+            let pick = p.nearest(to: camera.eye)
+            if pick.a < panoMeshRanges.count {
+                let near = simd_distance(p.poses[pick.a].position, camera.eye)
+                let r = panoMeshRanges[pick.a]
+                if !r.isEmpty && near < 45 { photographed = r }
+            }
+        }
+
+        if let r = photographed {
+            enc.drawIndexedPrimitives(
+                type: .triangle, indexCount: r.count,
+                indexType: .uint32, indexBuffer: indexBuffer,
+                indexBufferOffset: r.lowerBound * MemoryLayout<UInt32>.stride)
+        } else {
+            enc.drawIndexedPrimitives(type: .triangle, indexCount: staticIndexCount,
+                                      indexType: .uint32, indexBuffer: indexBuffer,
+                                      indexBufferOffset: 0)
+        }
         enc.endEncoding()
     }
 
@@ -674,6 +702,11 @@ final class Renderer {
                 albedo = albedo * (tex / lum);
             }
             albedo = facade(albedo, in.world, n, in.params, viewDir, u, gloss);
+        } else if (in.material > 6.5) {
+            // The panorama as geometry. It carries the light of the moment it
+            // was taken, so it is shown as photographed rather than relit.
+            albedo = panos.sample(orthoSampler, in.params.xy, uint(in.params.z)).rgb;
+            photographic = 1.0;
         } else if (in.material > 5.5) {
             // Photographic façade. The plate already contains the building's own
             // shading from the day it was photographed, so it is lit only
@@ -754,7 +787,7 @@ final class Renderer {
         // Projective texturing. Where a panorama covers this point, it replaces
         // everything procedural: it is a photograph of the actual place, at full
         // resolution, and no reconstruction stands between it and the screen.
-        if (u.panoParams.y > 0.5) {
+        if (false) {
             float da = length(in.world - u.panoA.xyz);
             float db = length(in.world - u.panoB.xyz);
             float near = min(da, db);

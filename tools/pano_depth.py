@@ -240,8 +240,43 @@ def run_one() -> int:
     return 0
 
 
+def run_all() -> int:
+    """Depth for every panorama, written beside it as a 16-bit PNG in centimetres.
+
+    16-bit because 8 would quantise a 60 m street into 24 cm steps, and that
+    shows as terracing on any surface you drive past slowly.
+    """
+    index = json.loads((DATA / "panoramas.json").read_text())
+    panos = sorted(index["panoramas"], key=lambda p: p["index"])
+    world = json.loads((DATA / "zurich_world.json").read_text())
+    made = 0
+    for i, pano in enumerate(panos):
+        src = PANOS / pano["file"]
+        dst = src.with_name(src.stem + "_depth.png")
+        if dst.exists():
+            continue
+        rgb = np.asarray(Image.open(src).convert("RGB"))
+        fitted = panorama_depth(rgb, origin=tuple(pano["pos"]),
+                                terrain=world["terrain"])
+        if fitted is None:
+            print(f"    ! {src.name}: no depth", file=sys.stderr)
+            continue
+        depth, solid, _, _ = fitted
+        cm = np.zeros(depth.shape, np.uint16)
+        cm[solid] = np.clip(depth[solid] * 100.0, 1, 65535).astype(np.uint16)
+        Image.fromarray(cm).save(dst)
+        made += 1
+        if (i + 1) % 10 == 0:
+            print(f"    {i + 1}/{len(panos)}", flush=True)
+    print(f"  wrote {made} depth maps")
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--one", action="store_true")
+    ap.add_argument("--all", action="store_true")
     args = ap.parse_args()
+    if args.all:
+        raise SystemExit(run_all())
     raise SystemExit(run_one() if args.one else (ap.print_help() or 0))
