@@ -54,6 +54,14 @@ final class DriveView: MTKView, MTKViewDelegate {
         // real photographs, and it is the only part of the city that looks the
         // way this project is aiming for — spawning anywhere else shows the
         // procedural build and buries the point.
+        // Start on the photographed run: it is the only stretch that looks the
+        // way this is aiming for, and a street midpoint elsewhere buries it.
+        if let pano = Self.panoramaStart() {
+            position = SIMD3(pano.x, 0, pano.z)
+            heading = pano.yaw
+            speed = 0
+            return
+        }
         if let spot = Self.plateViewpoint() {
             position = SIMD3(spot.x, 0, spot.z)
             heading = spot.yaw

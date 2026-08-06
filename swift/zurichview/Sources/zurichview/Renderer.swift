@@ -254,7 +254,7 @@ final class Renderer {
             // Fade the projection out with distance from the capture point:
             // beyond that, parallax error grows and the procedural material is
             // the better answer.
-            uniforms.panoParams = SIMD4(pick.blend, 1, 60, 0)
+            uniforms.panoParams = SIMD4(pick.blend, 1, 140, 0)
         }
 
         // --- Shadow pass ---

@@ -37,8 +37,8 @@ PANO_DIR.mkdir(parents=True, exist_ok=True)
 # 4096x2048 gives 0.088 deg/px — about 2.3 cm on a wall at 15 m, which is
 # comfortably enough to read a shop sign. Full 5660x2830 would be 64 MB each and
 # the whole point is to hold a run of them resident at once.
-PANO_W, PANO_H = 4096, 2048
-COUNT = 10
+PANO_W, PANO_H = 3072, 1536
+COUNT = 44
 CAMERA_HEIGHT = 2.2
 
 FIELDS = ("id,thumb_original_url,computed_geometry,computed_rotation,is_pano,"
@@ -85,7 +85,7 @@ def detail(image_id: str, tok: str) -> dict | None:
         return None
 
 
-def build(centre_x: float, centre_z: float, radius: float = 140.0) -> None:
+def build(centre_x: float, centre_z: float, radius: float = 320.0) -> None:
     world = json.loads((DATA / "zurich_world.json").read_text())
     e0, n0 = world["origin"]["east"], world["origin"]["north"]
     grid = world["terrain"]

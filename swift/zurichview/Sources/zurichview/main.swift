@@ -45,13 +45,16 @@ print(String(format: "Streetscape built in %.2f s — %d triangles",
              -clock.timeIntervalSinceNow, mesh.streetscapeRange.count / 3))
 print("  total \(mesh.indices.count / 3) triangles")
 
-// Photographic façades and panoramas are retired. Reconstruction from street
-// imagery could not get past "pictures on fake buildings", because the geometry
-// underneath was guessed. This is a game now, built the way driving games are:
-// real map for layout, authored art for appearance.
+// Façade *plates* stay retired — rebuilding a flat texture from many photographs
+// never got past "pictures on fake buildings". Whole panoramas projected from
+// their own camera pose are a different thing: one photograph, at full
+// resolution, with no reconstruction between it and the screen.
 
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
+clock = Date()
+let panoCount = renderer.loadPanoramas(indexURL: locate("panoramas.json"))
+print(String(format: "Panoramas: %d loaded in %.2f s", panoCount, -clock.timeIntervalSinceNow))
 clock = Date()
 renderer.loadOrtho(imageURL: orthoImageURL, metaURL: orthoMetaURL)
 print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
@@ -125,8 +128,8 @@ for (name, jx, jz, height) in [
 
 shots.append(Shot(
     name: "pano",
-    camera: Camera(eye: SIMD3(1633.2, 38.4, 609.6),
-                   target: SIMD3(1593.7, 36.9, 615.9),
+    camera: Camera(eye: SIMD3(1630.6, 37.0, 659.1),
+                   target: SIMD3(1606.5, 35.5, 627.1),
                    fovDegrees: 70),
     note: "projective panorama"))
 
