@@ -74,6 +74,25 @@ struct Panoramas {
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
             else { continue }
             ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+            // Pack the segmentation into alpha, which the RGBA texture already
+            // allocates and nothing else uses. The renderer needs to know what
+            // kind of thing each direction holds, and a parallel texture would
+            // double the memory for one byte per pixel.
+            let maskURL = dir.appendingPathComponent(
+                (pano.file as NSString).deletingPathExtension + "_mask.png")
+            if let msrc = CGImageSourceCreateWithURL(maskURL as CFURL, nil),
+               let mimg = CGImageSourceCreateImageAtIndex(msrc, 0, nil) {
+                var mask = [UInt8](repeating: 255, count: w * h)
+                if let mctx = CGContext(data: &mask, width: w, height: h,
+                                        bitsPerComponent: 8, bytesPerRow: w,
+                                        space: CGColorSpaceCreateDeviceGray(),
+                                        bitmapInfo: CGImageAlphaInfo.none.rawValue) {
+                    mctx.draw(mimg, in: CGRect(x: 0, y: 0, width: w, height: h))
+                    for i in 0..<(w * h) { pixels[i * 4 + 3] = mask[i] }
+                }
+            }
+
             tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
                         slice: slice, withBytes: pixels,
                         bytesPerRow: w * 4, bytesPerImage: w * h * 4)

@@ -580,7 +580,8 @@ final class Renderer {
     /// Sample one panorama by casting a ray from its camera to a world point.
     static float3 sample_pano(float3 world, float3 camPos, float3x3 rot,
                               uint layer, texture2d_array<float> panos,
-                              sampler smp, thread float& usable) {
+                              sampler smp, thread float& usable,
+                              thread float& category) {
         float3 d = world - camPos;
         // Our frame is X east, Y up, Z south; Mapillary poses are against local
         // ENU, so swap before rotating into the camera.
@@ -602,7 +603,10 @@ final class Renderer {
         // bumper is the least interesting thing in frame.
         float below = -lat;                       // radians below horizontal
         usable = 1.0 - smoothstep(0.35, 0.50, below);
-        return panos.sample(smp, uv, layer).rgb;
+        float4 s = panos.sample(smp, uv, layer);
+        // Alpha carries the segmentation: 0 sky, 1/3 ground, 2/3 structure, 1 other.
+        category = s.a;
+        return s.rgb;
     }
 
     static inline float3 aces(float3 x) {
@@ -756,13 +760,28 @@ final class Renderer {
             float near = min(da, db);
             float reach = smoothstep(u.panoParams.z, u.panoParams.z * 0.55, near);
             if (reach > 0.001) {
-                float ua = 1.0, ub = 1.0;
+                float ua = 1.0, ub = 1.0, ca = 1.0, cb = 1.0;
                 float3 pa = sample_pano(in.world, u.panoA.xyz, u.panoARot,
-                                        uint(u.panoA.w), panos, orthoSampler, ua);
+                                        uint(u.panoA.w), panos, orthoSampler, ua, ca);
                 float3 pb = sample_pano(in.world, u.panoB.xyz, u.panoBRot,
-                                        uint(u.panoB.w), panos, orthoSampler, ub);
+                                        uint(u.panoB.w), panos, orthoSampler, ub, cb);
                 float3 photo = mix(pa, pb, u.panoParams.x);
                 reach *= mix(ua, ub, u.panoParams.x);
+
+                // Silhouette carving. Footprint extrusions use an estimated
+                // height, so our boxes routinely stand taller and wider than the
+                // buildings do — and the projection cheerfully paints sky, trees
+                // and distant rooftops onto the surplus, which is what the hard
+                // floating rectangles were.
+                //
+                // The photograph settles it: where both views agree they are
+                // looking at sky, nothing solid is there, so do not draw the box
+                // at all. Requiring both rules out a single bad segmentation
+                // punching a hole through a real wall.
+                bool wallOrRoof = (in.material > 0.5 && in.material < 2.5);
+                if (wallOrRoof && reach > 0.55 && ca < 0.17 && cb < 0.17) {
+                    discard_fragment();
+                }
                 // The photograph carries its own light, as the orthophoto does.
                 lit = mix(lit, photo * mix(0.72, 1.0, visibility), reach);
             }
