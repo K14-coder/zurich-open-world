@@ -4,6 +4,13 @@ import simd
 /// Find the world data whether we are run from the scratchpad or from the repo,
 /// where the Swift package sits two levels below `data/`.
 func locate(_ name: String) -> URL {
+    // Inside a .app the working directory is "/", so the bundle's own Resources
+    // must be checked first; the relative paths below are for running from a
+    // checkout.
+    if let res = Bundle.main.resourceURL {
+        let bundled = res.appendingPathComponent("data").appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+    }
     let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let candidates = ["..", "../..", "../../data", "../data", "data", "."]
     for c in candidates {
@@ -38,8 +45,10 @@ print(String(format: "Streetscape built in %.2f s — %d triangles",
              -clock.timeIntervalSinceNow, mesh.streetscapeRange.count / 3))
 print("  total \(mesh.indices.count / 3) triangles")
 
-let plateCount = mesh.buildPlates(url: locate("facade_atlas.json"))
-print("Photographic façades: \(plateCount) plates")
+// Photographic façades and panoramas are retired. Reconstruction from street
+// imagery could not get past "pictures on fake buildings", because the geometry
+// underneath was guessed. This is a game now, built the way driving games are:
+// real map for layout, authored art for appearance.
 
 let network = try RoadNetwork(contentsOf: worldURL)
 let renderer = try Renderer(mesh: mesh)
@@ -48,13 +57,6 @@ renderer.loadOrtho(imageURL: orthoImageURL, metaURL: orthoMetaURL)
 print(String(format: "Ortho ground texture loaded in %.2f s", -clock.timeIntervalSinceNow))
 clock = Date()
 let materialsDir = worldURL.deletingLastPathComponent().appendingPathComponent("materials")
-let panoCount = renderer.loadPanoramas(indexURL: locate("panoramas.json"))
-print("Panoramas loaded: \(panoCount)")
-if renderer.loadFacadeAtlas(url: locate("facade_atlas.jpg")) {
-    print("Façade atlas loaded")
-} else {
-    print("Façade atlas NOT loaded")
-}
 if renderer.loadMaterials(directory: materialsDir) {
     print(String(format: "PBR materials loaded in %.2f s", -clock.timeIntervalSinceNow))
 } else {
@@ -103,6 +105,23 @@ shots.append(Shot(
     name: "hottingen-low",
     camera: Camera(eye: SIMD3(1280, 55, 820), target: SIMD3(1560, 25, 430), fovDegrees: 55),
     note: "low over Freiestrasse"))
+
+// Near-vertical over the busiest junction in the city, where seven edges meet.
+// This is the reference shot for road mesh quality: mitre joins and junction
+// fill either work here or they very obviously don't. Kept as a permanent shot
+// so a regression in the road builder shows up as a picture, not a bug report.
+for (name, jx, jz, height) in [
+    ("junction", 1311.6, 553.0, Float(52)),        // seven arms, the worst case
+    ("crossroads", 87.3, 408.1, Float(34)),        // four equal arms, the clean case
+] {
+    let ground = Float(mesh.terrainHeight(x: jx, z: jz))
+    shots.append(Shot(
+        name: name,
+        camera: Camera(eye: SIMD3(Float(jx), ground + height, Float(jz) + height * 0.27),
+                       target: SIMD3(Float(jx), ground, Float(jz)),
+                       fovDegrees: 52),
+        note: "near-vertical over \(name)"))
+}
 
 shots.append(Shot(
     name: "pano",

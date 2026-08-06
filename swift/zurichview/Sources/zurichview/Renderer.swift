@@ -68,7 +68,7 @@ final class Renderer {
     // city depth, and hides the edge of the world for free.
     private let skyTop = SIMD3<Float>(0.28, 0.46, 0.72)
     private let skyHorizon = SIMD3<Float>(0.74, 0.81, 0.88)
-    private let sunDirection = normalize(SIMD3<Float>(-0.42, 0.62, 0.55))
+    private let sunDirection = normalize(SIMD3<Float>(-0.34, 1.15, 0.42))
 
     init(mesh: WorldMesh) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -242,7 +242,7 @@ final class Renderer {
                          Float(materials?.wallLayers ?? 1)),
             panoA: .zero, panoB: .zero,
             panoARot: matrix_identity_float3x3, panoBRot: matrix_identity_float3x3,
-            panoParams: .zero)
+            panoParams: SIMD4(0, 0, 0, ProcessInfo.processInfo.environment["ZURICH_DEBUG"] != nil ? 1 : 0))
 
         if let p = panoramas, p.poses.count > 1 {
             let pick = p.nearest(to: camera.eye)
@@ -533,11 +533,15 @@ final class Renderer {
 
         // Glass: dark interior plus a sky reflection that strengthens at grazing
         // angles. This is what stops windows looking like grey paint.
-        float fres = pow(1.0 - saturate(dot(n, -viewDir)), 3.0);
+        float fres = pow(1.0 - saturate(dot(n, -viewDir)), 4.0);
         float3 sky = mix(u.skyHorizon.xyz, u.skyTop.xyz, 0.35);
         float3 interior = float3(0.055, 0.065, 0.080)
                         + hash11(bayIndex * 3.7 + floor(h / storey) * 11.3) * 0.045;
-        float3 glass = mix(interior, sky, 0.18 + 0.62 * fres);
+        // Cap the sky reflection. Unclamped, a façade seen at a grazing angle
+        // has every window driven fully to sky colour, and down a receding
+        // street those merge into soft vertical bands that wash the building
+        // out — it reads as a rendering fault, not as glass.
+        float3 glass = mix(interior, sky, 0.16 + 0.34 * fres);
 
         float bar = step(0.47, fract(fx * 2.0)) * step(fract(fx * 2.0), 0.53);
         glass = mix(glass, albedo * 0.85, bar * 0.55 * win);
@@ -768,6 +772,20 @@ final class Renderer {
         float fog = 1.0 - exp(-dist * u.fog.w);
         lit = mix(lit, u.fog.xyz, clamp(fog, 0.0, 1.0));
 
+        // Debug: colour by material id, to identify a surface instead of
+        // guessing at it.
+        if (u.panoParams.w > 0.5) {
+            float m = in.material;
+            float3 key = float3(0.5);
+            if (m < 0.5)       key = float3(1.0, 0.0, 1.0);  // plain solids
+            else if (m < 1.5)  key = float3(0.2, 0.5, 1.0);  // wall
+            else if (m < 2.5)  key = float3(1.0, 0.5, 0.0);  // roof
+            else if (m < 3.5)  key = float3(0.2, 1.0, 0.3);  // terrain/pavement
+            else if (m < 4.5)  key = float3(0.0, 0.6, 0.0);  // foliage
+            else if (m < 5.5)  key = float3(0.6, 0.6, 0.6);  // road
+            else               key = float3(1.0, 0.0, 0.0);  // plate
+            return float4(key, 1.0);
+        }
         return float4(aces(lit * 1.05), 1.0);
     }
 

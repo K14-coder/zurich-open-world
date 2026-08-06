@@ -227,42 +227,13 @@ final class WorldMesh {
 
     private func buildRoads(_ edges: [WorldJSON.Edge]) {
         let start = indices.count
-        for edge in edges {
-            let pts = edge.p.compactMap { p -> SIMD3<Double>? in
-                p.count == 3 ? SIMD3(p[0], p[1], p[2]) : nil
-            }
-            guard pts.count >= 2 else { continue }
-            let half = edge.w / 2
-            let colour = roadColour(edge.c)
-
-            for k in 0..<(pts.count - 1) {
-                let a = pts[k], b = pts[k + 1]
-                var dir = b - a
-                dir.y = 0
-                let len = simd_length(dir)
-                guard len > 1e-6 else { continue }
-                dir /= len
-                let side = SIMD3<Double>(-dir.z, 0, dir.x) * half
-                // Lift the carriageway a few centimetres. The road heights come
-                // from the same terrain grid the ground mesh does, so without
-                // this they are coplanar and z-fight into a shimmering mess.
-                let lift = SIMD3<Double>(0, 0.08, 0)
-                let quad = [a - side + lift, a + side + lift,
-                            b - side + lift, b + side + lift]
-                let base = UInt32(vertices.count)
-                for corner in quad {
-                    vertices.append(Vertex(
-                        position: SIMD3(Float(corner.x), Float(corner.y), Float(corner.z)),
-                        normal: SIMD3(0, 1, 0),
-                        colour: colour, material: .road))
-                }
-                indices += [base, base + 2, base + 1, base + 1, base + 2, base + 3]
-            }
-        }
+        // The mesh itself is built in Roads.swift: mitred ribbons, approaches
+        // trimmed back from each junction, and the junctions filled in.
+        buildRoadSurface(edges)
         roadRange = start..<indices.count
     }
 
-    private func roadColour(_ cls: String) -> SIMD3<Float> {
+    func roadColour(_ cls: String) -> SIMD3<Float> {
         switch cls.replacingOccurrences(of: "_link", with: "") {
         // Real asphalt is dark, but a dark albedo under canyon shade crushes to
         // black once tone mapping is applied. These are lifted deliberately.
@@ -278,8 +249,14 @@ final class WorldMesh {
     private func buildBuildings(_ list: [BuildingsJSON.Building]) {
         let start = indices.count
         for (n, b) in list.enumerated() {
-            let ring = b.r.map { SIMD2<Double>($0[0], $0[1]) }
+            var ring = b.r.map { SIMD2<Double>($0[0], $0[1]) }
             guard ring.count >= 3 else { continue }
+            // Terraced buildings share a party wall, so two footprints put walls
+            // in exactly the same plane. Rendered two-sided they z-fight, which
+            // shows as soft vertical bands marching along a terrace — and no
+            // lighting change makes them go away. Pulling each footprint in by a
+            // few centimetres separates the planes for good.
+            if let shrunk = shrinkRing(ring, by: 0.04) { ring = shrunk }
             let base = b.b
             let top = b.b + b.h
 
@@ -328,18 +305,7 @@ final class WorldMesh {
                 indices += [idx, idx + 2, idx + 1, idx + 1, idx + 2, idx + 3]
             }
 
-            // Roof
-            let roofBase = UInt32(vertices.count)
-            for p in ring {
-                vertices.append(Vertex(
-                    position: SIMD3(Float(p.x), Float(top), Float(p.y)),
-                    normal: SIMD3(0, 1, 0), colour: roof, material: .roof))
-            }
-            for t in stride(from: 0, to: b.t.count - 2, by: 3) {
-                indices += [roofBase + UInt32(b.t[t]),
-                            roofBase + UInt32(b.t[t + 1]),
-                            roofBase + UInt32(b.t[t + 2])]
-            }
+            addRoof(ring: ring, top: top, colour: roof, cap: b.t, seed: hash)
         }
         buildingRange = start..<indices.count
     }

@@ -185,6 +185,14 @@ extension WorldMesh {
         let width = 2.4
         let kerbColour = SIMD3<Float>(0.55, 0.54, 0.52)
 
+        // Trim against the same junction graph the carriageway uses. Without
+        // this the kerb walks straight through every intersection, and since it
+        // sits above the tarmac it covers precisely the corners the junction
+        // fill exists to get right. The extra allowance is the pavement's own
+        // width: a kerb line 2.4 m outside the centreline reaches further into
+        // the junction than the road surface does.
+        let radii = junctionTrimRadii(roadEdgesForPavement, extra: width)
+
         for edge in roadEdgesForPavement {
             // Service roads and alleys do not get formal pavements, and adding
             // them turns every courtyard into a maze of kerbs.
@@ -192,9 +200,11 @@ extension WorldMesh {
             guard ["primary", "secondary", "tertiary", "residential"].contains(cls) else {
                 continue
             }
-            let pts = edge.p.compactMap { p -> SIMD3<Double>? in
+            let raw = edge.p.compactMap { p -> SIMD3<Double>? in
                 p.count == 3 ? SIMD3(p[0], p[1], p[2]) : nil
             }
+            guard raw.count >= 2 else { continue }
+            let pts = WorldMesh.trimAtJunctions(raw, radii: radii)
             guard pts.count >= 2 else { continue }
             let half = edge.w / 2
 

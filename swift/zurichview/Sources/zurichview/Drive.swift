@@ -54,12 +54,6 @@ final class DriveView: MTKView, MTKViewDelegate {
         // real photographs, and it is the only part of the city that looks the
         // way this project is aiming for — spawning anywhere else shows the
         // procedural build and buries the point.
-        if let pano = Self.panoramaStart() {
-            position = SIMD3(pano.x, 0, pano.z)
-            heading = pano.yaw
-            speed = 0
-            return
-        }
         if let spot = Self.plateViewpoint() {
             position = SIMD3(spot.x, 0, spot.z)
             heading = spot.yaw
@@ -118,6 +112,10 @@ final class DriveView: MTKView, MTKViewDelegate {
     private static func plateURL() throws -> URL { try dataURL("facade_atlas.json") }
 
     private static func dataURL(_ name: String) throws -> URL {
+        if let res = Bundle.main.resourceURL {
+            let bundled = res.appendingPathComponent("data").appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+        }
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for c in ["..", "../..", "../../data", "../data", "data", "."] {
             let u = cwd.appendingPathComponent(c).appendingPathComponent(name)
