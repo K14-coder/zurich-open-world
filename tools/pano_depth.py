@@ -33,6 +33,8 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
+from zurich_world import terrain_at
+
 HERE = pathlib.Path(__file__).parent
 DATA = HERE.parent / "data"
 PANOS = DATA / "panoramas"
@@ -41,6 +43,10 @@ MODEL_URL = ("https://huggingface.co/onnx-community/depth-anything-v2-small/"
              "resolve/main/onnx/model.onnx")
 
 FACE = 518          # Depth Anything V2 input size
+# Faces are cut at 110°, not 90°. At exactly 90° adjacent faces only touch along
+# an edge, and the joint solve below needs shared directions — genuinely
+# overlapping cones — to tie one face's scale to its neighbour's.
+FACE_FOV = 110.0
 CAMERA_HEIGHT = 2.2
 # Faces: name, forward vector. Up is omitted — it is sky, and sky has no useful
 # depth; down is kept because the road is the anchor the scale is fitted to.
@@ -81,7 +87,8 @@ def face_directions(forward: np.ndarray, size: int) -> np.ndarray:
     right /= np.linalg.norm(right)
     up = np.cross(forward, right)
 
-    t = (np.arange(size) + 0.5) / size * 2 - 1      # -1..1 across a 90° face
+    half = np.tan(np.radians(FACE_FOV) / 2)
+    t = ((np.arange(size) + 0.5) / size * 2 - 1) * half
     u, v = np.meshgrid(t, t)
     d = forward[None, None, :] + u[..., None] * right + v[..., None] * up
     return d / np.linalg.norm(d, axis=2, keepdims=True)
@@ -128,14 +135,59 @@ def bilinear(img: np.ndarray, col: np.ndarray, row: np.ndarray) -> np.ndarray:
             + img[r0 + 1, c0] * (1 - fc) * fr + img[r0 + 1, c0 + 1] * fc * fr)
 
 
-def panorama_depth(rgb: np.ndarray):
-    """Metric-shaped inverse depth per pixel of an equirectangular panorama.
+def ground_disparity(rays: np.ndarray, origin, terrain) -> np.ndarray:
+    """Metric disparity where each downward ray actually meets the ground.
 
-    Gathers rather than scatters. Pushing 518x518 samples per face outward into
-    a 3072x1536 grid leaves three quarters of it empty, and no amount of hole
-    filling recovers that — the first version of this produced a uniform depth
-    map because the scale fit saw almost nothing but road. Asking each output
-    pixel which face it came from cannot leave a hole.
+    Marches the ray against the swissALTI3D height field rather than against an
+    assumed flat plane. Returns 0 where the ray never lands, so those samples
+    drop out of the fit.
+    """
+    ox, oy, oz = origin
+    out = np.zeros(rays.shape[0], np.float64)
+    steps = np.concatenate([np.arange(1.0, 20.0, 0.5), np.arange(20.0, 160.0, 2.0)])
+    prev_gap = None
+    prev_t = None
+    for tt in steps:
+        px = ox + rays[:, 0] * tt
+        py = oy + rays[:, 1] * tt
+        pz = oz + rays[:, 2] * tt
+        gh = np.array([terrain_at(terrain, float(a), float(b)) for a, b in zip(px, pz)])
+        gap = py - gh                      # positive while still above ground
+        if prev_gap is not None:
+            crossed = (prev_gap > 0) & (gap <= 0) & (out == 0)
+            if crossed.any():
+                # Linear interpolation between the bracketing steps.
+                f = prev_gap[crossed] / np.maximum(1e-6, prev_gap[crossed] - gap[crossed])
+                out[crossed] = prev_t + f * (tt - prev_t)
+        prev_gap, prev_t = gap, tt
+    hit = out > 0.5
+    disp = np.zeros(rays.shape[0], np.float64)
+    disp[hit] = 1.0 / out[hit]
+    return disp
+
+
+def panorama_depth(rgb: np.ndarray, origin=None, terrain=None):
+    """Metric depth per pixel, by solving all faces together.
+
+    Depth Anything normalises every image it is given, so the five faces come
+    back in five incompatible scales — measured disparity maxima on one panorama
+    were 9.3, 10.7, 15.3, 8.5 and 5.6, all bottoming out at zero. Assembling them
+    and fitting a single scale and shift to the result is meaningless, and it
+    collapses every pixel to roughly the same distance.
+
+    So solve for a scale and shift *per face*, from two kinds of equation:
+
+      overlap  where two faces see the same direction, their metric disparities
+               must agree — this ties the ring of faces into one scale
+      ground   where a ray points below the horizon it eventually meets the
+               ground, and swissALTI3D says exactly where. Assuming instead a
+               flat level road is wrong in a way that matters: Zurich is hilly,
+               and on a rising street a near-horizon ray meets tarmac far sooner
+               than flat geometry predicts, so every far anchor is too distant
+               and the whole fit compresses.
+
+    The overlaps make the faces mutually consistent; the ground makes them
+    metric. Neither alone is enough.
     """
     h, w = rgb.shape[:2]
     lon = (np.arange(w) + 0.5) / w * 2 * np.pi - np.pi
@@ -145,82 +197,147 @@ def panorama_depth(rgb: np.ndarray):
                      -np.sin(LAT),
                      np.cos(LAT) * np.cos(LON)], axis=2)
 
-    inv_depth = np.zeros((h, w), np.float32)
-    valid = np.zeros((h, w), bool)
+    half = np.tan(np.radians(FACE_FOV) / 2)
+    per_face, inside_face, central = [], [], []
 
     for _, forward in FACES:
         fdirs = face_directions(forward, FACE)
-        face = sample_equirect(rgb, fdirs)
-        est = estimate(face)
+        est = estimate(sample_equirect(rgb, fdirs))
         if est.shape != (FACE, FACE):
             est = np.asarray(Image.fromarray(est).resize((FACE, FACE), Image.BILINEAR))
 
         right, up = face_basis(forward)
         ahead = dirs @ forward
-        u = (dirs @ right)
-        v = (dirs @ up)
         with np.errstate(divide="ignore", invalid="ignore"):
-            fu = u / ahead
-            fv = v / ahead
-        # Inside this face, with a sliver of margin so neighbours meet cleanly.
-        inside = (ahead > 1e-6) & (np.abs(fu) <= 1.001) & (np.abs(fv) <= 1.001)
-        if not inside.any():
-            continue
-        col = (fu[inside] + 1) / 2 * FACE - 0.5
-        row = (fv[inside] + 1) / 2 * FACE - 0.5
-        inv_depth[inside] = bilinear(est, col, row)
-        valid[inside] = True
+            fu = (dirs @ right) / ahead
+            fv = (dirs @ up) / ahead
+        inside = (ahead > 1e-6) & (np.abs(fu) <= half) & (np.abs(fv) <= half)
 
-    return inv_depth, valid, dirs
+        d = np.zeros((h, w), np.float32)
+        if inside.any():
+            col = (fu[inside] / half + 1) / 2 * FACE - 0.5
+            row = (fv[inside] / half + 1) / 2 * FACE - 0.5
+            d[inside] = bilinear(est, col, row)
+        per_face.append(d)
+        inside_face.append(inside)
+        # How square-on the ray is: a face's own centre is far more trustworthy
+        # than its corners, both for blending and for weighting the solve.
+        c = np.zeros((h, w), np.float32)
+        c[inside] = np.clip(ahead[inside], 0, 1) ** 2
+        central.append(c)
 
-
-def anchor_to_metres(inv_depth, valid, dirs):
-    """Fit scale and shift so the road comes out at its true distance.
-
-    Depth Anything returns relative inverse depth: correct in shape, arbitrary
-    in units. The ground gives the anchor, because for any ray pointing below
-    the horizon the distance to a flat road is camera height over the sine of
-    the angle below it. Fitting against those rays converts the whole map to
-    metres without needing any other measurement.
-    """
+    n = len(FACES)
     down = -dirs[..., 1]
-    # The band has to be wide, and that is the whole difficulty. Rays steeply
-    # below the horizon hit the road 3 m away; rays just below it hit the same
-    # road 70 m away. Fitting only the steep ones gives an 8 m baseline, and
-    # extrapolating a disparity fit from 8 m out to 100 m collapses the slope to
-    # nothing — every pixel then lands at the same distance, which is exactly
-    # what the first attempt produced. Below 0.75 excludes the capture vehicle.
-    band = (down > 0.030) & (down < 0.75) & valid
-    if band.sum() < 500:
-        return None
-    true_depth = CAMERA_HEIGHT / down[band]
-    inv_true = 1.0 / true_depth
-    x = inv_depth[band]
-    # Sky leaks into the shallow end of the band on an uphill street; its
-    # disparity is near zero and it would drag the fit.
-    alive = x > np.percentile(inv_depth[valid], 2)
-    x, inv_true = x[alive], inv_true[alive]
-    if x.size < 500:
-        return None
+    sub = (slice(None, None, 6), slice(None, None, 6))     # subsample for the solve
 
-    # Robust least squares: a fifth of that band is the car's bonnet, kerbs and
-    # painted lines rather than clean road, and those would drag a plain fit.
-    keep = np.ones(x.shape, bool)
-    scale = shift = 0.0
-    for _ in range(4):
-        A = np.stack([x[keep], np.ones(keep.sum())], axis=1)
-        sol, *_ = np.linalg.lstsq(A, inv_true[keep], rcond=None)
-        scale, shift = float(sol[0]), float(sol[1])
-        resid = np.abs(scale * x + shift - inv_true)
-        keep = resid < max(1e-4, 2.5 * np.median(resid))
+    rows, rhs, weights = [], [], []
+
+    # --- overlap equations ---
+    for i in range(n):
+        for j in range(i + 1, n):
+            both = inside_face[i][sub] & inside_face[j][sub]
+            if both.sum() < 200:
+                continue
+            di = per_face[i][sub][both]
+            dj = per_face[j][sub][both]
+            wgt = np.minimum(central[i][sub][both], central[j][sub][both])
+            keep = wgt > 0.15
+            if keep.sum() < 200:
+                continue
+            di, dj, wgt = di[keep], dj[keep], wgt[keep]
+            # Cap how many equations any one pair contributes, so a large
+            # overlap cannot outvote the ground anchor.
+            if di.size > 4000:
+                pick = np.random.default_rng(0).choice(di.size, 4000, replace=False)
+                di, dj, wgt = di[pick], dj[pick], wgt[pick]
+            r = np.zeros((di.size, 2 * n), np.float64)
+            r[:, 2 * i] = di
+            r[:, 2 * i + 1] = 1
+            r[:, 2 * j] = -dj
+            r[:, 2 * j + 1] = -1
+            rows.append(r)
+            rhs.append(np.zeros(di.size))
+            weights.append(wgt)
+
+    # --- ground equations ---
+    ground_total = 0
+    for i in range(n):
+        m = inside_face[i][sub] & (down[sub] > 0.030) & (down[sub] < 0.75)
+        if m.sum() < 200:
+            continue
+        di = per_face[i][sub][m]
+        if origin is None or terrain is None:
+            true_disp = down[sub][m] / CAMERA_HEIGHT
+        else:
+            true_disp = ground_disparity(dirs[sub][m], origin, terrain)
+        wgt = central[i][sub][m]
+        keep = (wgt > 0.15) & (di > 1e-4) & (true_disp > 1e-6)
         if keep.sum() < 200:
-            break
+            continue
+        di, true_disp, wgt = di[keep], true_disp[keep], wgt[keep]
 
-    metric_inv = scale * inv_depth + shift
-    depth = np.full(inv_depth.shape, np.inf, np.float32)
-    good = metric_inv > 1e-3
-    depth[good] = 1.0 / metric_inv[good]
-    return np.clip(depth, 0.5, 300.0), good
+        # Balance the band in log distance, not in pixels. Road 3 m away fills a
+        # huge wedge of the image; road 70 m away is a thin sliver near the
+        # horizon — yet the sliver carries all the far-field information. Sampled
+        # by pixel the fit is swamped by near ground, and the shift term rises
+        # until 1/shift caps the whole scene at about 11 m, which is exactly the
+        # ceiling this produced before.
+        dist = 1.0 / np.maximum(true_disp, 1e-6)
+        bins = np.clip(((np.log(dist) - np.log(2.5)) / (np.log(90.0) - np.log(2.5))
+                        * 12).astype(int), 0, 11)
+        rng = np.random.default_rng(1)
+        chosen = []
+        for bi in range(12):
+            idx = np.flatnonzero(bins == bi)
+            if idx.size == 0:
+                continue
+            take = min(idx.size, 500)
+            chosen.append(rng.choice(idx, take, replace=False))
+        if not chosen:
+            continue
+        sel = np.concatenate(chosen)
+        di, true_disp, wgt = di[sel], true_disp[sel], wgt[sel]
+        r = np.zeros((di.size, 2 * n), np.float64)
+        r[:, 2 * i] = di
+        r[:, 2 * i + 1] = 1
+        rows.append(r)
+        rhs.append(true_disp)
+        # The ground is the only metric information in the whole system.
+        weights.append(wgt * 3.0)
+        ground_total += di.size
+
+    if not rows or ground_total < 500:
+        return None
+    A = np.vstack(rows)
+    b = np.concatenate(rhs)
+    W = np.concatenate(weights)
+
+    # Robust: parked cars, kerbs and anything standing on the road break the
+    # flat-ground assumption, and a plain fit lets them drag the scale.
+    sol = None
+    for _ in range(4):
+        Aw = A * W[:, None]
+        sol, *_ = np.linalg.lstsq(Aw, b * W, rcond=None)
+        resid = np.abs(A @ sol - b)
+        scale = max(1e-6, 2.5 * np.median(resid))
+        W = np.concatenate(weights) * np.clip(1.0 - resid / (4 * scale), 0.05, 1.0)
+
+    # --- compose ---
+    disp = np.zeros((h, w), np.float64)
+    wsum = np.zeros((h, w), np.float64)
+    for i in range(n):
+        m = inside_face[i]
+        a_i, b_i = sol[2 * i], sol[2 * i + 1]
+        contrib = a_i * per_face[i][m] + b_i
+        disp[m] += contrib * central[i][m]
+        wsum[m] += central[i][m]
+    good = wsum > 1e-6
+    disp[good] /= wsum[good]
+
+    solid = good & (disp > 1.0 / 300.0)
+    depth = np.full((h, w), np.inf, np.float32)
+    depth[solid] = (1.0 / disp[solid]).astype(np.float32)
+    return np.clip(depth, 0.5, 300.0), solid, dirs, sol
 
 
 def run_one() -> int:
@@ -230,12 +347,17 @@ def run_one() -> int:
     rgb = np.asarray(Image.open(src).convert("RGB"))
     print(f"  {src.name}  {rgb.shape[1]}x{rgb.shape[0]}")
 
-    inv, valid, dirs = panorama_depth(rgb)
-    fitted = anchor_to_metres(inv, valid, dirs)
+    world = json.loads((DATA / "zurich_world.json").read_text())
+    terrain = world["terrain"]
+    origin = (pano["pos"][0], pano["pos"][1], pano["pos"][2])
+    fitted = panorama_depth(rgb, origin=origin, terrain=terrain)
     if fitted is None:
         print("  FAIL — not enough ground to anchor the scale", file=sys.stderr)
         return 1
-    depth, good = fitted
+    depth, good, dirs, sol = fitted
+    print("  per-face scale/shift:")
+    for k, (name, _) in enumerate(FACES):
+        print(f"    {name:6s} scale {sol[2*k]:8.4f}  shift {sol[2*k+1]:+8.4f}")
 
     band = depth[(depth < 250) & good]
     print(f"  depth {np.percentile(band,2):.1f}..{np.percentile(band,98):.1f} m "
